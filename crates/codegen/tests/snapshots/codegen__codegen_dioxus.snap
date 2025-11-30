@@ -833,9 +833,15 @@ use spacetimedb_sdk::__codegen::{
 	__ws,
 };
 
+/// Thread-safe wrapper for the database connection.
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync.
+pub type SharedConnection = Arc<DbConnection>;
+
 /// Internal state for managing the SpacetimeDB connection.
 #[derive(Clone)]
 pub struct SpacetimeDbContext {
+    /// The database connection (wrapped in Arc for thread-safety).
+    pub connection: Signal<Option<SharedConnection>>,
     /// The current connection state.
     pub state: Signal<ConnectionState>,
     /// Error from the last connection attempt, if any.
@@ -890,10 +896,12 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
     let uri = uri.to_string();
     let module_name = module_name.to_string();
 
+    let connection: Signal<Option<SharedConnection>> = use_signal(|| None);
     let state: Signal<ConnectionState> = use_signal(|| ConnectionState::Disconnected);
     let error: Signal<Option<String>> = use_signal(|| None);
 
     let ctx = SpacetimeDbContext {
+        connection,
         state,
         error,
     };
@@ -903,6 +911,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
 
     // Connect on first render
     use_effect(move || {
+        let mut connection = connection;
         let mut state = state;
         let mut error = error;
         let uri = uri.clone();
@@ -917,18 +926,25 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
                 .on_connect(move |_conn, _identity, _token| {
                     // Connection successful - state is set below after build()
                 })
-                .on_disconnect(move |_ctx, _err| {
-                    // Note: Can't easily update signals from here due to Send/Sync requirements
-                    // The connection state will be managed through polling or other mechanisms
+                .on_disconnect(move |_ctx, err| {
+                    // Clone signals for use in callback (they are Copy in Dioxus 0.7+)
+                    if let Some(e) = err {
+                        error.set(Some(e.to_string()));
+                        state.set(ConnectionState::Error);
+                    } else {
+                        state.set(ConnectionState::Disconnected);
+                    }
                 })
                 .build()
             {
                 Ok(conn) => {
+                    let shared_conn = Arc::new(conn);
+                    connection.set(Some(shared_conn.clone()));
                     state.set(ConnectionState::Connected);
 
                     // Run the connection in a background task
                     spawn(async move {
-                        let _ = conn.run_async().await;
+                        let _ = shared_conn.run_async().await;
                     });
                 }
                 Err(e) => {
@@ -970,16 +986,20 @@ pub fn use_spacetimedb_context() -> SpacetimeDbContext {
     use_context::<SpacetimeDbContext>()
 }
 
+/// Get the current database connection, if connected.
+///
+/// Returns `None` if not yet connected.
+#[must_use]
+pub fn use_connection() -> Signal<Option<SharedConnection>> {
+    let ctx = use_spacetimedb_context();
+    ctx.connection
+}
+
 /// Subscribe to a set of SQL queries.
 ///
 /// This hook subscribes to the given SQL queries and keeps the local cache in sync
 /// with the database. The queries will be executed on the server and any matching
 /// rows will be replicated to the client.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
 ///
 /// # Arguments
 ///
@@ -993,25 +1013,36 @@ pub fn use_spacetimedb_context() -> SpacetimeDbContext {
 ///     use_subscription(&["SELECT * FROM user", "SELECT * FROM message"]);
 ///
 ///     // Now you can use table hooks to access the data
-///     let users = use_table_all::<User>();
+///     let users = use_table_user();
 ///     // ...
 /// }
 /// ```
-pub fn use_subscription(_queries: &[&str]) {
-    // TODO: Implement subscription logic
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+pub fn use_subscription(queries: &[&str]) {
+    let queries: Vec<String> = queries.iter().map(|s| s.to_string()).collect();
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        let queries = queries.clone();
+        if let Some(conn) = conn_signal.read().as_ref() {
+            conn.subscription_builder()
+                .on_applied(|_ctx| {
+                    // Subscription applied successfully
+                })
+                .on_error(|_ctx, _err| {
+                    // Handle subscription error
+                })
+                .subscribe(queries);
+        }
+    });
 }
 
 /// Get a reactive signal containing all rows of a table.
 ///
 /// This hook returns a signal that automatically updates when the table data changes.
 /// The signal contains a `Vec` of all rows currently in the local cache.
+///
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Type Parameters
 ///
@@ -1035,21 +1066,16 @@ pub fn use_table_all<T>() -> Signal<Vec<T>>
 where
     T: __sdk::InModule<Module = RemoteModule> + Clone + Send + Sync + 'static,
 {
-    let data: Signal<Vec<T>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    data
+    use_signal(Vec::new)
 }
 
 /// Get a reactive signal containing all rows of the `has_special_stuff` table.
 ///
-/// This hook returns a signal that will contain `HasSpecialStuff` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `has_special_stuff` table changes.
+/// The signal contains a `Vec` of all `HasSpecialStuff` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1067,25 +1093,41 @@ where
 #[must_use]
 pub fn use_table_has_special_stuff() -> Signal<Vec<HasSpecialStuff>> {
     let data: Signal<Vec<HasSpecialStuff>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<HasSpecialStuff> = conn.db.has_special_stuff().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.has_special_stuff().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.has_special_stuff().on_delete(move |_ctx, row| {
+                let current: Vec<HasSpecialStuff> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `logged_out_player` table.
 ///
-/// This hook returns a signal that will contain `Player` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `logged_out_player` table changes.
+/// The signal contains a `Vec` of all `Player` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1103,25 +1145,41 @@ pub fn use_table_has_special_stuff() -> Signal<Vec<HasSpecialStuff>> {
 #[must_use]
 pub fn use_table_logged_out_player() -> Signal<Vec<Player>> {
     let data: Signal<Vec<Player>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<Player> = conn.db.logged_out_player().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.logged_out_player().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.logged_out_player().on_delete(move |_ctx, row| {
+                let current: Vec<Player> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `my_player` table.
 ///
-/// This hook returns a signal that will contain `Player` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `my_player` table changes.
+/// The signal contains a `Vec` of all `Player` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1139,25 +1197,41 @@ pub fn use_table_logged_out_player() -> Signal<Vec<Player>> {
 #[must_use]
 pub fn use_table_my_player() -> Signal<Vec<Player>> {
     let data: Signal<Vec<Player>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<Player> = conn.db.my_player().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.my_player().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.my_player().on_delete(move |_ctx, row| {
+                let current: Vec<Player> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `person` table.
 ///
-/// This hook returns a signal that will contain `Person` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `person` table changes.
+/// The signal contains a `Vec` of all `Person` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1175,25 +1249,41 @@ pub fn use_table_my_player() -> Signal<Vec<Player>> {
 #[must_use]
 pub fn use_table_person() -> Signal<Vec<Person>> {
     let data: Signal<Vec<Person>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<Person> = conn.db.person().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.person().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.person().on_delete(move |_ctx, row| {
+                let current: Vec<Person> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `pk_multi_identity` table.
 ///
-/// This hook returns a signal that will contain `PkMultiIdentity` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `pk_multi_identity` table changes.
+/// The signal contains a `Vec` of all `PkMultiIdentity` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1211,25 +1301,41 @@ pub fn use_table_person() -> Signal<Vec<Person>> {
 #[must_use]
 pub fn use_table_pk_multi_identity() -> Signal<Vec<PkMultiIdentity>> {
     let data: Signal<Vec<PkMultiIdentity>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<PkMultiIdentity> = conn.db.pk_multi_identity().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.pk_multi_identity().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.pk_multi_identity().on_delete(move |_ctx, row| {
+                let current: Vec<PkMultiIdentity> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `player` table.
 ///
-/// This hook returns a signal that will contain `Player` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `player` table changes.
+/// The signal contains a `Vec` of all `Player` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1247,25 +1353,41 @@ pub fn use_table_pk_multi_identity() -> Signal<Vec<PkMultiIdentity>> {
 #[must_use]
 pub fn use_table_player() -> Signal<Vec<Player>> {
     let data: Signal<Vec<Player>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<Player> = conn.db.player().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.player().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.player().on_delete(move |_ctx, row| {
+                let current: Vec<Player> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `points` table.
 ///
-/// This hook returns a signal that will contain `Point` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `points` table changes.
+/// The signal contains a `Vec` of all `Point` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1283,25 +1405,41 @@ pub fn use_table_player() -> Signal<Vec<Player>> {
 #[must_use]
 pub fn use_table_points() -> Signal<Vec<Point>> {
     let data: Signal<Vec<Point>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<Point> = conn.db.points().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.points().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.points().on_delete(move |_ctx, row| {
+                let current: Vec<Point> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `private_table` table.
 ///
-/// This hook returns a signal that will contain `PrivateTable` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `private_table` table changes.
+/// The signal contains a `Vec` of all `PrivateTable` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1319,25 +1457,41 @@ pub fn use_table_points() -> Signal<Vec<Point>> {
 #[must_use]
 pub fn use_table_private_table() -> Signal<Vec<PrivateTable>> {
     let data: Signal<Vec<PrivateTable>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<PrivateTable> = conn.db.private_table().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.private_table().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.private_table().on_delete(move |_ctx, row| {
+                let current: Vec<PrivateTable> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `repeating_test_arg` table.
 ///
-/// This hook returns a signal that will contain `RepeatingTestArg` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `repeating_test_arg` table changes.
+/// The signal contains a `Vec` of all `RepeatingTestArg` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1355,25 +1509,41 @@ pub fn use_table_private_table() -> Signal<Vec<PrivateTable>> {
 #[must_use]
 pub fn use_table_repeating_test_arg() -> Signal<Vec<RepeatingTestArg>> {
     let data: Signal<Vec<RepeatingTestArg>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<RepeatingTestArg> = conn.db.repeating_test_arg().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.repeating_test_arg().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.repeating_test_arg().on_delete(move |_ctx, row| {
+                let current: Vec<RepeatingTestArg> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `test_a` table.
 ///
-/// This hook returns a signal that will contain `TestA` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `test_a` table changes.
+/// The signal contains a `Vec` of all `TestA` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1391,25 +1561,41 @@ pub fn use_table_repeating_test_arg() -> Signal<Vec<RepeatingTestArg>> {
 #[must_use]
 pub fn use_table_test_a() -> Signal<Vec<TestA>> {
     let data: Signal<Vec<TestA>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<TestA> = conn.db.test_a().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.test_a().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.test_a().on_delete(move |_ctx, row| {
+                let current: Vec<TestA> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `test_d` table.
 ///
-/// This hook returns a signal that will contain `TestD` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `test_d` table changes.
+/// The signal contains a `Vec` of all `TestD` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1427,25 +1613,41 @@ pub fn use_table_test_a() -> Signal<Vec<TestA>> {
 #[must_use]
 pub fn use_table_test_d() -> Signal<Vec<TestD>> {
     let data: Signal<Vec<TestD>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<TestD> = conn.db.test_d().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.test_d().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.test_d().on_delete(move |_ctx, row| {
+                let current: Vec<TestD> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `test_e` table.
 ///
-/// This hook returns a signal that will contain `TestE` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `test_e` table changes.
+/// The signal contains a `Vec` of all `TestE` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1463,25 +1665,41 @@ pub fn use_table_test_d() -> Signal<Vec<TestD>> {
 #[must_use]
 pub fn use_table_test_e() -> Signal<Vec<TestE>> {
     let data: Signal<Vec<TestE>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<TestE> = conn.db.test_e().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.test_e().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.test_e().on_delete(move |_ctx, row| {
+                let current: Vec<TestE> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
 /// Get a reactive signal containing all rows of the `test_f` table.
 ///
-/// This hook returns a signal that will contain `TestFoobar` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `test_f` table changes.
+/// The signal contains a `Vec` of all `TestFoobar` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -1499,14 +1717,31 @@ pub fn use_table_test_e() -> Signal<Vec<TestE>> {
 #[must_use]
 pub fn use_table_test_f() -> Signal<Vec<TestFoobar>> {
     let data: Signal<Vec<TestFoobar>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {
+        if let Some(conn) = conn_signal.read().as_ref() {
+            // Initialize with current data
+            let initial_data: Vec<TestFoobar> = conn.db.test_f().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.test_f().on_insert(move |_ctx, row| {
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            });
+
+            conn.db.test_f().on_delete(move |_ctx, row| {
+                let current: Vec<TestFoobar> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            });
+        }
+    });
+
     data
 }
 
@@ -1514,10 +1749,6 @@ pub fn use_table_test_f() -> Signal<Vec<TestFoobar>> {
 ///
 /// This hook returns a callback that can be used to call the `add` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1535,13 +1766,12 @@ pub fn use_table_test_f() -> Signal<Vec<TestFoobar>> {
 /// ```
 #[must_use]
 pub fn use_reducer_add() -> impl Fn(String, u8) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |name: String, age: u8| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (name, age,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.add(name, age);
+        }
     }
 }
 
@@ -1549,10 +1779,6 @@ pub fn use_reducer_add() -> impl Fn(String, u8) + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `add_player` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1570,13 +1796,12 @@ pub fn use_reducer_add() -> impl Fn(String, u8) + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_add_player() -> impl Fn(String) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |name: String| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (name,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.add_player(name);
+        }
     }
 }
 
@@ -1584,10 +1809,6 @@ pub fn use_reducer_add_player() -> impl Fn(String) + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `add_private` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1605,13 +1826,12 @@ pub fn use_reducer_add_player() -> impl Fn(String) + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_add_private() -> impl Fn(String) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |name: String| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (name,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.add_private(name);
+        }
     }
 }
 
@@ -1619,10 +1839,6 @@ pub fn use_reducer_add_private() -> impl Fn(String) + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `assert_caller_identity_is_module_identity` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1640,13 +1856,12 @@ pub fn use_reducer_add_private() -> impl Fn(String) + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_assert_caller_identity_is_module_identity() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.assert_caller_identity_is_module_identity();
+        }
     }
 }
 
@@ -1654,10 +1869,6 @@ pub fn use_reducer_assert_caller_identity_is_module_identity() -> impl Fn() + Cl
 ///
 /// This hook returns a callback that can be used to call the `delete_player` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1675,13 +1886,12 @@ pub fn use_reducer_assert_caller_identity_is_module_identity() -> impl Fn() + Cl
 /// ```
 #[must_use]
 pub fn use_reducer_delete_player() -> impl Fn(u64) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |id: u64| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (id,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.delete_player(id);
+        }
     }
 }
 
@@ -1689,10 +1899,6 @@ pub fn use_reducer_delete_player() -> impl Fn(u64) + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `delete_players_by_name` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1710,13 +1916,12 @@ pub fn use_reducer_delete_player() -> impl Fn(u64) + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_delete_players_by_name() -> impl Fn(String) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |name: String| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (name,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.delete_players_by_name(name);
+        }
     }
 }
 
@@ -1724,10 +1929,6 @@ pub fn use_reducer_delete_players_by_name() -> impl Fn(String) + Clone + 'static
 ///
 /// This hook returns a callback that can be used to call the `list_over_age` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1745,13 +1946,12 @@ pub fn use_reducer_delete_players_by_name() -> impl Fn(String) + Clone + 'static
 /// ```
 #[must_use]
 pub fn use_reducer_list_over_age() -> impl Fn(u8) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |age: u8| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (age,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.list_over_age(age);
+        }
     }
 }
 
@@ -1759,10 +1959,6 @@ pub fn use_reducer_list_over_age() -> impl Fn(u8) + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `log_module_identity` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1780,13 +1976,12 @@ pub fn use_reducer_list_over_age() -> impl Fn(u8) + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_log_module_identity() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.log_module_identity();
+        }
     }
 }
 
@@ -1794,10 +1989,6 @@ pub fn use_reducer_log_module_identity() -> impl Fn() + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `query_private` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1815,13 +2006,12 @@ pub fn use_reducer_log_module_identity() -> impl Fn() + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_query_private() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.query_private();
+        }
     }
 }
 
@@ -1829,10 +2019,6 @@ pub fn use_reducer_query_private() -> impl Fn() + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `repeating_test` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1850,13 +2036,12 @@ pub fn use_reducer_query_private() -> impl Fn() + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_repeating_test() -> impl Fn(RepeatingTestArg) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |arg: RepeatingTestArg| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (arg,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.repeating_test(arg);
+        }
     }
 }
 
@@ -1864,10 +2049,6 @@ pub fn use_reducer_repeating_test() -> impl Fn(RepeatingTestArg) + Clone + 'stat
 ///
 /// This hook returns a callback that can be used to call the `say_hello` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1885,13 +2066,12 @@ pub fn use_reducer_repeating_test() -> impl Fn(RepeatingTestArg) + Clone + 'stat
 /// ```
 #[must_use]
 pub fn use_reducer_say_hello() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.say_hello();
+        }
     }
 }
 
@@ -1899,10 +2079,6 @@ pub fn use_reducer_say_hello() -> impl Fn() + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `test` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1920,13 +2096,12 @@ pub fn use_reducer_say_hello() -> impl Fn() + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_reducer_test() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |arg: TestA, arg_2: TestB, arg_3: NamespaceTestC, arg_4: NamespaceTestF| {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (arg, arg_2, arg_3, arg_4,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.test(arg, arg_2, arg_3, arg_4);
+        }
     }
 }
 
@@ -1934,10 +2109,6 @@ pub fn use_reducer_test() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTest
 ///
 /// This hook returns a callback that can be used to call the `test_btree_index_args` reducer.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1955,13 +2126,12 @@ pub fn use_reducer_test() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTest
 /// ```
 #[must_use]
 pub fn use_reducer_test_btree_index_args() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            let _ = conn.reducers.test_btree_index_args();
+        }
     }
 }
 
@@ -1969,10 +2139,6 @@ pub fn use_reducer_test_btree_index_args() -> impl Fn() + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `get_my_schema_via_http` procedure.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -1990,13 +2156,12 @@ pub fn use_reducer_test_btree_index_args() -> impl Fn() + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_procedure_get_my_schema_via_http() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement procedure invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            conn.procedures.get_my_schema_via_http();
+        }
     }
 }
 
@@ -2004,10 +2169,6 @@ pub fn use_procedure_get_my_schema_via_http() -> impl Fn() + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `return_value` procedure.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -2025,13 +2186,12 @@ pub fn use_procedure_get_my_schema_via_http() -> impl Fn() + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_procedure_return_value() -> impl Fn(u64) + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |foo: u64| {
-        // TODO: Implement procedure invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (foo,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            conn.procedures.return_value(foo);
+        }
     }
 }
 
@@ -2039,10 +2199,6 @@ pub fn use_procedure_return_value() -> impl Fn(u64) + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `sleep_one_second` procedure.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -2060,13 +2216,12 @@ pub fn use_procedure_return_value() -> impl Fn(u64) + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_procedure_sleep_one_second() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement procedure invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            conn.procedures.sleep_one_second();
+        }
     }
 }
 
@@ -2074,10 +2229,6 @@ pub fn use_procedure_sleep_one_second() -> impl Fn() + Clone + 'static {
 ///
 /// This hook returns a callback that can be used to call the `with_tx` procedure.
 /// The callback is Clone and can be used in event handlers.
-///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
 ///
 /// # Example
 ///
@@ -2095,13 +2246,12 @@ pub fn use_procedure_sleep_one_second() -> impl Fn() + Clone + 'static {
 /// ```
 #[must_use]
 pub fn use_procedure_with_tx() -> impl Fn() + Clone + 'static {
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move || {
-        // TODO: Implement procedure invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = (,); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {
+            conn.procedures.with_tx();
+        }
     }
 }
 

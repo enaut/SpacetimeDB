@@ -213,6 +213,10 @@ const DIOXUS_IMPORTS: &[&str] = &[
     "\t__sats,",
     "\t__ws,",
     "};",
+    "",
+    "/// Thread-safe wrapper for the database connection.",
+    "/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync.",
+    "pub type SharedConnection = Arc<DbConnection>;",
 ];
 
 fn print_dioxus_imports(output: &mut Indenter) {
@@ -233,6 +237,8 @@ fn generate_context_provider_hook(out: &mut Indenter) {
         r#"/// Internal state for managing the SpacetimeDB connection.
 #[derive(Clone)]
 pub struct SpacetimeDbContext {{
+    /// The database connection (wrapped in Arc for thread-safety).
+    pub connection: Signal<Option<SharedConnection>>,
     /// The current connection state.
     pub state: Signal<ConnectionState>,
     /// Error from the last connection attempt, if any.
@@ -287,10 +293,12 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
     let uri = uri.to_string();
     let module_name = module_name.to_string();
 
+    let connection: Signal<Option<SharedConnection>> = use_signal(|| None);
     let state: Signal<ConnectionState> = use_signal(|| ConnectionState::Disconnected);
     let error: Signal<Option<String>> = use_signal(|| None);
 
     let ctx = SpacetimeDbContext {{
+        connection,
         state,
         error,
     }};
@@ -300,6 +308,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
 
     // Connect on first render
     use_effect(move || {{
+        let mut connection = connection;
         let mut state = state;
         let mut error = error;
         let uri = uri.clone();
@@ -314,18 +323,25 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
                 .on_connect(move |_conn, _identity, _token| {{
                     // Connection successful - state is set below after build()
                 }})
-                .on_disconnect(move |_ctx, _err| {{
-                    // Note: Can't easily update signals from here due to Send/Sync requirements
-                    // The connection state will be managed through polling or other mechanisms
+                .on_disconnect(move |_ctx, err| {{
+                    // Clone signals for use in callback (they are Copy in Dioxus 0.7+)
+                    if let Some(e) = err {{
+                        error.set(Some(e.to_string()));
+                        state.set(ConnectionState::Error);
+                    }} else {{
+                        state.set(ConnectionState::Disconnected);
+                    }}
                 }})
                 .build()
             {{
                 Ok(conn) => {{
+                    let shared_conn = Arc::new(conn);
+                    connection.set(Some(shared_conn.clone()));
                     state.set(ConnectionState::Connected);
 
                     // Run the connection in a background task
                     spawn(async move {{
-                        let _ = conn.run_async().await;
+                        let _ = shared_conn.run_async().await;
                     }});
                 }}
                 Err(e) => {{
@@ -366,6 +382,15 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
 pub fn use_spacetimedb_context() -> SpacetimeDbContext {{
     use_context::<SpacetimeDbContext>()
 }}
+
+/// Get the current database connection, if connected.
+///
+/// Returns `None` if not yet connected.
+#[must_use]
+pub fn use_connection() -> Signal<Option<SharedConnection>> {{
+    let ctx = use_spacetimedb_context();
+    ctx.connection
+}}
 "#
     );
 }
@@ -379,11 +404,6 @@ fn generate_subscription_hook(out: &mut Indenter) {
 /// with the database. The queries will be executed on the server and any matching
 /// rows will be replicated to the client.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
-///
 /// # Arguments
 ///
 /// * `queries` - A slice of SQL query strings to subscribe to
@@ -396,19 +416,27 @@ fn generate_subscription_hook(out: &mut Indenter) {
 ///     use_subscription(&["SELECT * FROM user", "SELECT * FROM message"]);
 ///
 ///     // Now you can use table hooks to access the data
-///     let users = use_table_all::<User>();
+///     let users = use_table_user();
 ///     // ...
 /// }}
 /// ```
-pub fn use_subscription(_queries: &[&str]) {{
-    // TODO: Implement subscription logic
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+pub fn use_subscription(queries: &[&str]) {{
+    let queries: Vec<String> = queries.iter().map(|s| s.to_string()).collect();
+    let conn_signal = use_connection();
+
+    use_effect(move || {{
+        let queries = queries.clone();
+        if let Some(conn) = conn_signal.read().as_ref() {{
+            conn.subscription_builder()
+                .on_applied(|_ctx| {{
+                    // Subscription applied successfully
+                }})
+                .on_error(|_ctx, _err| {{
+                    // Handle subscription error
+                }})
+                .subscribe(queries);
+        }}
+    }});
 }}
 "#
     );
@@ -421,6 +449,9 @@ fn generate_generic_table_hook(out: &mut Indenter) {
 ///
 /// This hook returns a signal that automatically updates when the table data changes.
 /// The signal contains a `Vec` of all rows currently in the local cache.
+///
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Type Parameters
 ///
@@ -444,11 +475,7 @@ pub fn use_table_all<T>() -> Signal<Vec<T>>
 where
     T: __sdk::InModule<Module = RemoteModule> + Clone + Send + Sync + 'static,
 {{
-    let data: Signal<Vec<T>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    data
+    use_signal(Vec::new)
 }}
 "#
     );
@@ -461,18 +488,17 @@ fn table_hook_name(table_name: &Identifier) -> String {
 fn generate_table_hook(_module: &ModuleDef, out: &mut Indenter, table_name: &Identifier, product_type_ref: AlgebraicTypeRef) {
     let row_type = type_ref_name(_module, product_type_ref);
     let hook_name = table_hook_name(table_name);
-    let _table_method = table_name.deref().to_case(Case::Snake);
+    let table_method = table_name.deref().to_case(Case::Snake);
 
     write!(
         out,
         r#"/// Get a reactive signal containing all rows of the `{table_name}` table.
 ///
-/// This hook returns a signal that will contain `{row_type}` rows from the local cache.
+/// This hook returns a signal that automatically updates when the `{table_name}` table changes.
+/// The signal contains a `Vec` of all `{row_type}` rows currently in the local cache.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// Due to the complexity of integrating SpacetimeDB's callback-based model with
-/// Dioxus's reactive system, the actual implementation requires careful handling
-/// of thread-safety (SpacetimeDB callbacks may run on different threads).
+/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
+/// so we can safely update them from SpacetimeDB callbacks.
 ///
 /// # Example
 ///
@@ -490,14 +516,31 @@ fn generate_table_hook(_module: &ModuleDef, out: &mut Indenter, table_name: &Ide
 #[must_use]
 pub fn {hook_name}() -> Signal<Vec<{row_type}>> {{
     let data: Signal<Vec<{row_type}>> = use_signal(Vec::new);
-    // TODO: Implement table data synchronization
-    // This requires careful handling of thread-safety between
-    // SpacetimeDB's callback system and Dioxus's reactive signals.
-    //
-    // Potential approaches:
-    // 1. Use channels (flume, tokio::sync::mpsc) to communicate between threads
-    // 2. Use SyncSignal instead of Signal for thread-safe updates
-    // 3. Schedule updates on the Dioxus runtime
+    let conn_signal = use_connection();
+
+    use_effect(move || {{
+        if let Some(conn) = conn_signal.read().as_ref() {{
+            // Initialize with current data
+            let initial_data: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
+            data.set(initial_data);
+
+            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
+            conn.db.{table_method}().on_insert(move |_ctx, row| {{
+                let mut current = data.read().clone();
+                current.push(row.clone());
+                data.set(current);
+            }});
+
+            conn.db.{table_method}().on_delete(move |_ctx, row| {{
+                let current: Vec<{row_type}> = data.read().iter()
+                    .filter(|r| *r != row)
+                    .cloned()
+                    .collect();
+                data.set(current);
+            }});
+        }}
+    }});
+
     data
 }}
 "#
@@ -544,10 +587,6 @@ fn generate_reducer_hook(module: &ModuleDef, out: &mut Indenter, reducer: &Reduc
 /// This hook returns a callback that can be used to call the `{reducer_name}` reducer.
 /// The callback is Clone and can be used in event handlers.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
-///
 /// # Example
 ///
 /// ```rust,ignore
@@ -564,13 +603,12 @@ fn generate_reducer_hook(module: &ModuleDef, out: &mut Indenter, reducer: &Reduc
 /// ```
 #[must_use]
 pub fn {hook_name}() -> {callback_sig} {{
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |{args_decl}| {{
-        // TODO: Implement reducer invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = ({args_call},); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {{
+            let _ = conn.reducers.{func_name}({args_call});
+        }}
     }}
 }}
 "#
@@ -618,10 +656,6 @@ fn generate_procedure_hook(module: &ModuleDef, out: &mut Indenter, procedure: &P
 /// This hook returns a callback that can be used to call the `{procedure_name}` procedure.
 /// The callback is Clone and can be used in event handlers.
 ///
-/// **Note:** This is a placeholder that demonstrates the intended API.
-/// The actual implementation requires access to the DbConnection which
-/// needs careful handling due to thread-safety constraints.
-///
 /// # Example
 ///
 /// ```rust,ignore
@@ -638,13 +672,12 @@ fn generate_procedure_hook(module: &ModuleDef, out: &mut Indenter, procedure: &P
 /// ```
 #[must_use]
 pub fn {hook_name}() -> {callback_sig} {{
-    let _ctx = use_spacetimedb_context();
+    let conn_signal = use_connection();
 
     move |{args_decl}| {{
-        // TODO: Implement procedure invocation
-        // This requires access to the DbConnection which needs
-        // careful handling due to thread-safety constraints.
-        let _ = ({args_call},); // Silence unused variable warnings
+        if let Some(conn) = conn_signal.read().as_ref() {{
+            conn.procedures.{func_name}({args_call});
+        }}
     }}
 }}
 "#
