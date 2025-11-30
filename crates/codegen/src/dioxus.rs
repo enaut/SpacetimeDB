@@ -130,14 +130,15 @@ fn generate_dioxus_module(module: &ModuleDef) -> OutputFile {
 //!
 //! fn App() -> Element {{
 //!     // Initialize the SpacetimeDB context at the root of your app
+//!     // This creates all table signals at the root level to avoid lifetime issues
 //!     use_spacetimedb_context_provider("http://localhost:3000", "my-module");
 //!
 //!     rsx! {{ Child {{}} }}
 //! }}
 //!
 //! fn Child() -> Element {{
-//!     // Use reactive table data
-//!     let users = use_table_all::<User>();
+//!     // Use reactive table data - the signal is retrieved from root context
+//!     let users = use_table_user();
 //!
 //!     rsx! {{
 //!         for user in users.read().iter() {{
@@ -156,8 +157,13 @@ fn generate_dioxus_module(module: &ModuleDef) -> OutputFile {
 
     out.newline();
 
+    // Generate the table signals context struct (holds all table signals)
+    generate_table_signals_context(module, out);
+
+    out.newline();
+
     // Generate the SpacetimeDB context provider hook
-    generate_context_provider_hook(out);
+    generate_context_provider_hook(module, out);
 
     out.newline();
 
@@ -166,12 +172,7 @@ fn generate_dioxus_module(module: &ModuleDef) -> OutputFile {
 
     out.newline();
 
-    // Generate generic table hook
-    generate_generic_table_hook(out);
-
-    out.newline();
-
-    // Generate table-specific hooks
+    // Generate table-specific hooks (now just retrieve from context)
     for (table_name, product_type_ref) in iter_table_names_and_types(module) {
         generate_table_hook(module, out, table_name, product_type_ref);
         out.newline();
@@ -204,9 +205,10 @@ const ALLOW_LINTS: &str = "#![allow(unused, clippy::all)]";
 
 const DIOXUS_IMPORTS: &[&str] = &[
     "use ::dioxus::prelude::*;",
+    "use ::dioxus::signals::SyncSignal;",
     "use std::sync::Arc;",
     "use super::*;",
-    "use spacetimedb_sdk::{DbContext, Table};",
+    "use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};",
     "use spacetimedb_sdk::__codegen::{",
     "\tself as __sdk,",
     "\t__lib,",
@@ -215,7 +217,7 @@ const DIOXUS_IMPORTS: &[&str] = &[
     "};",
     "",
     "/// Thread-safe wrapper for the database connection.",
-    "/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync.",
+    "/// We use SyncSignal (Signal with SyncStorage) for thread-safe access from SpacetimeDB callbacks.",
     "pub type SharedConnection = Arc<DbConnection>;",
 ];
 
@@ -231,18 +233,86 @@ fn print_file_header(output: &mut Indenter, include_version: bool) {
     writeln!(output, "{ALLOW_LINTS}");
 }
 
-fn generate_context_provider_hook(out: &mut Indenter) {
+fn table_signal_field_name(table_name: &Identifier) -> String {
+    table_name.deref().to_case(Case::Snake)
+}
+
+fn generate_table_signals_context(module: &ModuleDef, out: &mut Indenter) {
+    // Generate the struct that holds all table signals
+    writeln!(out, "/// Container for all table signals, created at root level.");
+    writeln!(
+        out,
+        "/// This ensures signals outlive any child components that use them."
+    );
+    writeln!(out, "#[derive(Clone, Copy)]");
+    writeln!(out, "pub struct TableSignals {{");
+    out.indent(1);
+
+    for (table_name, product_type_ref) in iter_table_names_and_types(module) {
+        let row_type = type_ref_name(module, product_type_ref);
+        let field_name = table_signal_field_name(table_name);
+        writeln!(out, "pub {field_name}: SyncSignal<Vec<{row_type}>>,");
+    }
+
+    out.dedent(1);
+    writeln!(out, "}}");
+}
+
+fn generate_context_provider_hook(module: &ModuleDef, out: &mut Indenter) {
+    // First, build the list of table fields for initialization
+    let mut table_fields_init = String::new();
+    // We'll also build the per-table callback registrations to insert into on_connect
+    let mut table_callbacks = String::new();
+
+    for (table_name, product_type_ref) in iter_table_names_and_types(module) {
+        let field_name = table_signal_field_name(table_name);
+        let row_type = type_ref_name(module, product_type_ref);
+        let table_method = table_name.deref().to_case(Case::Snake);
+
+        // Field initialization
+        table_fields_init.push_str(&format!("        {field_name}: use_signal_sync(Vec::new),\n"));
+
+        // Callback registration for this table: populate initial rows and register insert/update/delete
+        table_callbacks.push_str(&format!(
+            r#"
+                    // Initialize and register callbacks for {table_name}
+                    let mut {field_name}_signal = table_signals.{field_name};
+                    // Populate initial rows
+                    let current: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
+                    {field_name}_signal.set(current);
+                    // Keep in sync on changes
+                    conn.db.{table_method}().on_insert(move |ctx, _row| {{
+                        let updated: Vec<{row_type}> = ctx.db.{table_method}().iter().collect();
+                        {field_name}_signal.set(updated);
+                    }});
+                    conn.db.{table_method}().on_update(move |ctx, _old, _new| {{
+                        let updated: Vec<{row_type}> = ctx.db.{table_method}().iter().collect();
+                        {field_name}_signal.set(updated);
+                    }});
+                    conn.db.{table_method}().on_delete(move |ctx, _row| {{
+                        let updated: Vec<{row_type}> = ctx.db.{table_method}().iter().collect();
+                        {field_name}_signal.set(updated);
+                    }});
+"#
+        ));
+    }
+
     write!(
         out,
-        r#"/// Internal state for managing the SpacetimeDB connection.
-#[derive(Clone)]
+        "{}",
+        format!(
+            r#"/// Internal state for managing the SpacetimeDB connection.
+/// Uses SyncSignal for thread-safe access from SpacetimeDB callbacks.
+#[derive(Clone, Copy)]
 pub struct SpacetimeDbContext {{
     /// The database connection (wrapped in Arc for thread-safety).
-    pub connection: Signal<Option<SharedConnection>>,
+    pub connection: SyncSignal<Option<SharedConnection>>,
     /// The current connection state.
-    pub state: Signal<ConnectionState>,
+    pub state: SyncSignal<ConnectionState>,
     /// Error from the last connection attempt, if any.
-    pub error: Signal<Option<String>>,
+    pub error: SyncSignal<Option<String>>,
+    /// All table signals, created at root level.
+    pub tables: TableSignals,
 }}
 
 /// The current state of the SpacetimeDB connection.
@@ -264,6 +334,10 @@ pub enum ConnectionState {{
 /// This hook must be called at the root component of your application before using
 /// any other SpacetimeDB hooks. It establishes the database connection and provides
 /// the context for all child components.
+///
+/// **Important:** All table signals are created here at the root level to ensure
+/// they outlive any child components that use them. This prevents issues with
+/// SpacetimeDB callbacks trying to access dropped signals.
 ///
 /// # Arguments
 ///
@@ -293,18 +367,25 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
     let uri = uri.to_string();
     let module_name = module_name.to_string();
 
-    let connection: Signal<Option<SharedConnection>> = use_signal(|| None);
-    let state: Signal<ConnectionState> = use_signal(|| ConnectionState::Disconnected);
-    let error: Signal<Option<String>> = use_signal(|| None);
+    // Use SyncSignal for thread-safe access from SpacetimeDB callbacks
+    let connection: SyncSignal<Option<SharedConnection>> = use_signal_sync(|| None);
+    let state: SyncSignal<ConnectionState> = use_signal_sync(|| ConnectionState::Disconnected);
+    let error: SyncSignal<Option<String>> = use_signal_sync(|| None);
+    
+    // Create all table signals at root level - this is crucial!
+    // These signals must outlive any child components that use them.
+    let table_signals = TableSignals {{
+{table_fields_init}    }};
 
     let ctx = SpacetimeDbContext {{
         connection,
         state,
         error,
+        tables: table_signals,
     }};
 
     // Provide the context to child components
-    use_context_provider(|| ctx.clone());
+    use_context_provider(|| ctx);
 
     // Connect on first render
     use_effect(move || {{
@@ -320,11 +401,12 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> Spaceti
             match DbConnection::builder()
                 .with_uri(&uri)
                 .with_module_name(&module_name)
-                .on_connect(move |_conn, _identity, _token| {{
-                    // Connection successful - state is set below after build()
+                .on_connect(move |conn, _identity, _token| {{
+                    // Initialize table signals with current data and register callbacks
+{table_callbacks}
                 }})
                 .on_disconnect(move |_ctx, err| {{
-                    // Clone signals for use in callback (they are Copy in Dioxus 0.7+)
+                    // SyncSignal is Send + Sync, so we can safely update from callbacks
                     if let Some(e) = err {{
                         error.set(Some(e.to_string()));
                         state.set(ConnectionState::Error);
@@ -387,11 +469,14 @@ pub fn use_spacetimedb_context() -> SpacetimeDbContext {{
 ///
 /// Returns `None` if not yet connected.
 #[must_use]
-pub fn use_connection() -> Signal<Option<SharedConnection>> {{
+pub fn use_connection() -> SyncSignal<Option<SharedConnection>> {{
     let ctx = use_spacetimedb_context();
     ctx.connection
 }}
-"#
+            "#,
+            table_fields_init = table_fields_init,
+            table_callbacks = table_callbacks
+        )
     );
 }
 
@@ -442,53 +527,19 @@ pub fn use_subscription(queries: &[&str]) {{
     );
 }
 
-fn generate_generic_table_hook(out: &mut Indenter) {
-    write!(
-        out,
-        r#"/// Get a reactive signal containing all rows of a table.
-///
-/// This hook returns a signal that automatically updates when the table data changes.
-/// The signal contains a `Vec` of all rows currently in the local cache.
-///
-/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
-/// so we can safely update them from SpacetimeDB callbacks.
-///
-/// # Type Parameters
-///
-/// * `T` - The row type of the table
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn UserList() -> Element {{
-///     let users: Signal<Vec<User>> = use_table_all::<User>();
-///
-///     rsx! {{
-///         for user in users.read().iter() {{
-///             div {{ "{{user.name}}" }}
-///         }}
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn use_table_all<T>() -> Signal<Vec<T>>
-where
-    T: __sdk::InModule<Module = RemoteModule> + Clone + Send + Sync + 'static,
-{{
-    use_signal(Vec::new)
-}}
-"#
-    );
-}
-
 fn table_hook_name(table_name: &Identifier) -> String {
     format!("use_table_{}", table_name.deref().to_case(Case::Snake))
 }
 
-fn generate_table_hook(_module: &ModuleDef, out: &mut Indenter, table_name: &Identifier, product_type_ref: AlgebraicTypeRef) {
+fn generate_table_hook(
+    _module: &ModuleDef,
+    out: &mut Indenter,
+    table_name: &Identifier,
+    product_type_ref: AlgebraicTypeRef,
+) {
     let row_type = type_ref_name(_module, product_type_ref);
     let hook_name = table_hook_name(table_name);
-    let table_method = table_name.deref().to_case(Case::Snake);
+    let field_name = table_signal_field_name(table_name);
 
     write!(
         out,
@@ -497,14 +548,8 @@ fn generate_table_hook(_module: &ModuleDef, out: &mut Indenter, table_name: &Ide
 /// This hook returns a signal that automatically updates when the `{table_name}` table changes.
 /// The signal contains a `Vec` of all `{row_type}` rows currently in the local cache.
 ///
-/// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
-/// so we can safely update them from SpacetimeDB callbacks.
-///
-/// # Performance Notes
-///
-/// - The signal is updated by re-fetching all table data on each insert/delete.
-/// - For tables with many rows or frequent updates, consider using a more
-///   targeted approach with primary key lookups.
+/// The signal is created at root level by `use_spacetimedb_context_provider` and retrieved
+/// here from the context, ensuring it outlives any child components.
 ///
 /// # Example
 ///
@@ -520,36 +565,9 @@ fn generate_table_hook(_module: &ModuleDef, out: &mut Indenter, table_name: &Ide
 /// }}
 /// ```
 #[must_use]
-pub fn {hook_name}() -> Signal<Vec<{row_type}>> {{
-    let data: Signal<Vec<{row_type}>> = use_signal(Vec::new);
-    let conn_signal = use_connection();
-
-    use_effect(move || {{
-        if let Some(conn) = conn_signal.read().as_ref() {{
-            // Initialize with current data from the cache
-            let initial_data: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
-            data.set(initial_data);
-
-            // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            // On insert, re-fetch all data to ensure consistency
-            conn.db.{table_method}().on_insert(move |_ctx, _row| {{
-                if let Some(conn) = conn_signal.read().as_ref() {{
-                    let updated: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
-                    data.set(updated);
-                }}
-            }});
-
-            // On delete, re-fetch all data to ensure consistency
-            conn.db.{table_method}().on_delete(move |_ctx, _row| {{
-                if let Some(conn) = conn_signal.read().as_ref() {{
-                    let updated: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
-                    data.set(updated);
-                }}
-            }});
-        }}
-    }});
-
-    data
+pub fn {hook_name}() -> SyncSignal<Vec<{row_type}>> {{
+    let ctx = use_spacetimedb_context();
+    ctx.tables.{field_name}
 }}
 "#
     );
@@ -716,7 +734,7 @@ fn generate_connection_state(out: &mut Indenter) {
 /// }}
 /// ```
 #[must_use]
-pub fn use_connection_state() -> Signal<ConnectionState> {{
+pub fn use_connection_state() -> SyncSignal<ConnectionState> {{
     let ctx = use_spacetimedb_context();
     ctx.state
 }}
@@ -739,7 +757,7 @@ pub fn use_connection_state() -> Signal<ConnectionState> {{
 /// }}
 /// ```
 #[must_use]
-pub fn use_connection_error() -> Signal<Option<String>> {{
+pub fn use_connection_error() -> SyncSignal<Option<String>> {{
     let ctx = use_spacetimedb_context();
     ctx.error
 }}
