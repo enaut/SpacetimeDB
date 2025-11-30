@@ -406,6 +406,7 @@ async fn generate_build_and_publish(
         Language::Csharp => "csharp",
         Language::TypeScript => "typescript",
         Language::UnrealCpp => "unrealcpp",
+        Language::Dioxus => "dioxus",
     };
 
     if client_language == &Language::TypeScript {

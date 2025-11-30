@@ -2,12 +2,14 @@ use spacetimedb_schema::def::{ModuleDef, ProcedureDef, ReducerDef, TableDef, Typ
 use spacetimedb_schema::schema::{Schema, TableSchema};
 mod code_indenter;
 pub mod csharp;
+pub mod dioxus;
 pub mod rust;
 pub mod typescript;
 pub mod unrealcpp;
 mod util;
 
 pub use self::csharp::Csharp;
+pub use self::dioxus::Dioxus;
 pub use self::rust::Rust;
 pub use self::typescript::TypeScript;
 pub use self::unrealcpp::UnrealCpp;

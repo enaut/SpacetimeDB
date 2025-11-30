@@ -5,7 +5,7 @@ use clap::parser::ValueSource;
 use clap::Arg;
 use clap::ArgAction::Set;
 use fs_err as fs;
-use spacetimedb_codegen::{generate, Csharp, Lang, OutputFile, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX};
+use spacetimedb_codegen::{generate, Csharp, Dioxus, Lang, OutputFile, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX};
 use spacetimedb_lib::de::serde::DeserializeWrapper;
 use spacetimedb_lib::{sats, RawModuleDef};
 use spacetimedb_schema;
@@ -72,7 +72,8 @@ pub fn cli() -> clap::Command {
                 .help("The system path (absolute or relative) to the generate output directory")
                 .required_if_eq("lang", "rust")
                 .required_if_eq("lang", "csharp")
-                .required_if_eq("lang", "typescript"),
+                .required_if_eq("lang", "typescript")
+                .required_if_eq("lang", "dioxus"),
         )
         .arg(
             Arg::new("uproject_dir")
@@ -191,6 +192,7 @@ pub async fn exec_ex(
         }
         Language::Rust => &Rust,
         Language::TypeScript => &TypeScript,
+        Language::Dioxus => &Dioxus,
     };
 
     for OutputFile { filename, code } in generate(&module, gen_lang) {
@@ -270,11 +272,12 @@ pub enum Language {
     TypeScript,
     Rust,
     UnrealCpp,
+    Dioxus,
 }
 
 impl clap::ValueEnum for Language {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Csharp, Self::TypeScript, Self::Rust, Self::UnrealCpp]
+        &[Self::Csharp, Self::TypeScript, Self::Rust, Self::UnrealCpp, Self::Dioxus]
     }
     fn to_possible_value(&self) -> Option<PossibleValue> {
         Some(match self {
@@ -282,6 +285,7 @@ impl clap::ValueEnum for Language {
             Self::TypeScript => clap::builder::PossibleValue::new("typescript").aliases(["ts", "TS"]),
             Self::Rust => clap::builder::PossibleValue::new("rust").aliases(["rs", "RS"]),
             Self::UnrealCpp => PossibleValue::new("unrealcpp").aliases(["uecpp", "ue5cpp", "unreal"]),
+            Self::Dioxus => PossibleValue::new("dioxus").aliases(["dx", "DX"]),
         })
     }
 }
@@ -289,7 +293,7 @@ impl clap::ValueEnum for Language {
 impl Language {
     fn format_files(&self, project_dir: &Path, generated_files: BTreeSet<PathBuf>) -> anyhow::Result<()> {
         match self {
-            Language::Rust => rustfmt(generated_files)?,
+            Language::Rust | Language::Dioxus => rustfmt(generated_files)?,
             Language::Csharp => dotnet_format(project_dir, generated_files)?,
             Language::TypeScript => {
                 // TODO: implement formatting.
