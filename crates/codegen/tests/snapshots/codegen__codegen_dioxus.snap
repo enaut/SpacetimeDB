@@ -1077,6 +1077,12 @@ where
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
 ///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -1097,23 +1103,25 @@ pub fn use_table_has_special_stuff() -> Signal<Vec<HasSpecialStuff>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<HasSpecialStuff> = conn.db.has_special_stuff().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.has_special_stuff().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.has_special_stuff().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<HasSpecialStuff> = conn.db.has_special_stuff().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.has_special_stuff().on_delete(move |_ctx, row| {
-                let current: Vec<HasSpecialStuff> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.has_special_stuff().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<HasSpecialStuff> = conn.db.has_special_stuff().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1128,6 +1136,12 @@ pub fn use_table_has_special_stuff() -> Signal<Vec<HasSpecialStuff>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1149,23 +1163,25 @@ pub fn use_table_logged_out_player() -> Signal<Vec<Player>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<Player> = conn.db.logged_out_player().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.logged_out_player().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.logged_out_player().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Player> = conn.db.logged_out_player().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.logged_out_player().on_delete(move |_ctx, row| {
-                let current: Vec<Player> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.logged_out_player().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Player> = conn.db.logged_out_player().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1180,6 +1196,12 @@ pub fn use_table_logged_out_player() -> Signal<Vec<Player>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1201,23 +1223,25 @@ pub fn use_table_my_player() -> Signal<Vec<Player>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<Player> = conn.db.my_player().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.my_player().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.my_player().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Player> = conn.db.my_player().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.my_player().on_delete(move |_ctx, row| {
-                let current: Vec<Player> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.my_player().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Player> = conn.db.my_player().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1232,6 +1256,12 @@ pub fn use_table_my_player() -> Signal<Vec<Player>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1253,23 +1283,25 @@ pub fn use_table_person() -> Signal<Vec<Person>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<Person> = conn.db.person().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.person().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.person().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Person> = conn.db.person().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.person().on_delete(move |_ctx, row| {
-                let current: Vec<Person> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.person().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Person> = conn.db.person().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1284,6 +1316,12 @@ pub fn use_table_person() -> Signal<Vec<Person>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1305,23 +1343,25 @@ pub fn use_table_pk_multi_identity() -> Signal<Vec<PkMultiIdentity>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<PkMultiIdentity> = conn.db.pk_multi_identity().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.pk_multi_identity().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.pk_multi_identity().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<PkMultiIdentity> = conn.db.pk_multi_identity().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.pk_multi_identity().on_delete(move |_ctx, row| {
-                let current: Vec<PkMultiIdentity> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.pk_multi_identity().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<PkMultiIdentity> = conn.db.pk_multi_identity().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1336,6 +1376,12 @@ pub fn use_table_pk_multi_identity() -> Signal<Vec<PkMultiIdentity>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1357,23 +1403,25 @@ pub fn use_table_player() -> Signal<Vec<Player>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<Player> = conn.db.player().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.player().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.player().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Player> = conn.db.player().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.player().on_delete(move |_ctx, row| {
-                let current: Vec<Player> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.player().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Player> = conn.db.player().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1388,6 +1436,12 @@ pub fn use_table_player() -> Signal<Vec<Player>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1409,23 +1463,25 @@ pub fn use_table_points() -> Signal<Vec<Point>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<Point> = conn.db.points().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.points().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.points().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Point> = conn.db.points().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.points().on_delete(move |_ctx, row| {
-                let current: Vec<Point> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.points().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<Point> = conn.db.points().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1440,6 +1496,12 @@ pub fn use_table_points() -> Signal<Vec<Point>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1461,23 +1523,25 @@ pub fn use_table_private_table() -> Signal<Vec<PrivateTable>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<PrivateTable> = conn.db.private_table().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.private_table().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.private_table().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<PrivateTable> = conn.db.private_table().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.private_table().on_delete(move |_ctx, row| {
-                let current: Vec<PrivateTable> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.private_table().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<PrivateTable> = conn.db.private_table().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1492,6 +1556,12 @@ pub fn use_table_private_table() -> Signal<Vec<PrivateTable>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1513,23 +1583,25 @@ pub fn use_table_repeating_test_arg() -> Signal<Vec<RepeatingTestArg>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<RepeatingTestArg> = conn.db.repeating_test_arg().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.repeating_test_arg().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.repeating_test_arg().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<RepeatingTestArg> = conn.db.repeating_test_arg().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.repeating_test_arg().on_delete(move |_ctx, row| {
-                let current: Vec<RepeatingTestArg> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.repeating_test_arg().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<RepeatingTestArg> = conn.db.repeating_test_arg().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1544,6 +1616,12 @@ pub fn use_table_repeating_test_arg() -> Signal<Vec<RepeatingTestArg>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1565,23 +1643,25 @@ pub fn use_table_test_a() -> Signal<Vec<TestA>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<TestA> = conn.db.test_a().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.test_a().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.test_a().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestA> = conn.db.test_a().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.test_a().on_delete(move |_ctx, row| {
-                let current: Vec<TestA> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.test_a().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestA> = conn.db.test_a().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1596,6 +1676,12 @@ pub fn use_table_test_a() -> Signal<Vec<TestA>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1617,23 +1703,25 @@ pub fn use_table_test_d() -> Signal<Vec<TestD>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<TestD> = conn.db.test_d().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.test_d().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.test_d().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestD> = conn.db.test_d().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.test_d().on_delete(move |_ctx, row| {
-                let current: Vec<TestD> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.test_d().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestD> = conn.db.test_d().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1648,6 +1736,12 @@ pub fn use_table_test_d() -> Signal<Vec<TestD>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1669,23 +1763,25 @@ pub fn use_table_test_e() -> Signal<Vec<TestE>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<TestE> = conn.db.test_e().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.test_e().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.test_e().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestE> = conn.db.test_e().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.test_e().on_delete(move |_ctx, row| {
-                let current: Vec<TestE> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.test_e().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestE> = conn.db.test_e().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });
@@ -1700,6 +1796,12 @@ pub fn use_table_test_e() -> Signal<Vec<TestE>> {
 ///
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
+///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
 ///
 /// # Example
 ///
@@ -1721,23 +1823,25 @@ pub fn use_table_test_f() -> Signal<Vec<TestFoobar>> {
 
     use_effect(move || {
         if let Some(conn) = conn_signal.read().as_ref() {
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<TestFoobar> = conn.db.test_f().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.test_f().on_insert(move |_ctx, row| {
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.test_f().on_insert(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestFoobar> = conn.db.test_f().iter().collect();
+                    data.set(updated);
+                }
             });
 
-            conn.db.test_f().on_delete(move |_ctx, row| {
-                let current: Vec<TestFoobar> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.test_f().on_delete(move |_ctx, _row| {
+                if let Some(conn) = conn_signal.read().as_ref() {
+                    let updated: Vec<TestFoobar> = conn.db.test_f().iter().collect();
+                    data.set(updated);
+                }
             });
         }
     });

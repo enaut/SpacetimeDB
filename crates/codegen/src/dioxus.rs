@@ -500,6 +500,12 @@ fn generate_table_hook(_module: &ModuleDef, out: &mut Indenter, table_name: &Ide
 /// In Dioxus 0.7+, Signals are Copy and thread-safe when T: Send + Sync,
 /// so we can safely update them from SpacetimeDB callbacks.
 ///
+/// # Performance Notes
+///
+/// - The signal is updated by re-fetching all table data on each insert/delete.
+/// - For tables with many rows or frequent updates, consider using a more
+///   targeted approach with primary key lookups.
+///
 /// # Example
 ///
 /// ```rust,ignore
@@ -520,23 +526,25 @@ pub fn {hook_name}() -> Signal<Vec<{row_type}>> {{
 
     use_effect(move || {{
         if let Some(conn) = conn_signal.read().as_ref() {{
-            // Initialize with current data
+            // Initialize with current data from the cache
             let initial_data: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
             data.set(initial_data);
 
             // Set up callbacks for updates - Signals are Copy in Dioxus 0.7+
-            conn.db.{table_method}().on_insert(move |_ctx, row| {{
-                let mut current = data.read().clone();
-                current.push(row.clone());
-                data.set(current);
+            // On insert, re-fetch all data to ensure consistency
+            conn.db.{table_method}().on_insert(move |_ctx, _row| {{
+                if let Some(conn) = conn_signal.read().as_ref() {{
+                    let updated: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
+                    data.set(updated);
+                }}
             }});
 
-            conn.db.{table_method}().on_delete(move |_ctx, row| {{
-                let current: Vec<{row_type}> = data.read().iter()
-                    .filter(|r| *r != row)
-                    .cloned()
-                    .collect();
-                data.set(current);
+            // On delete, re-fetch all data to ensure consistency
+            conn.db.{table_method}().on_delete(move |_ctx, _row| {{
+                if let Some(conn) = conn_signal.read().as_ref() {{
+                    let updated: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
+                    data.set(updated);
+                }}
             }});
         }}
     }});
