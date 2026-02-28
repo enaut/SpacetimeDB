@@ -1,106 +1,56 @@
-//! Code generation for Dioxus signals and hooks.
+//! Code generation for Dioxus v0.7 signals and hooks with SpacetimeDB v2.0.
 //!
-//! This module generates Dioxus-compatible Rust code that provides reactive signals and hooks
-//! for interacting with SpacetimeDB tables and reducers.
+//! Generates a `dioxus.rs` module that wraps the standard Rust SDK types with Dioxus
+//! reactive signals and hooks. This provides:
 //!
-//! The generated code provides:
-//! - `use_table_*()` hooks that return reactive signals containing table data
-//! - `use_reducer_*()` hooks for calling reducers with proper Dioxus integration
-//! - `use_spacetimedb_connection()` hook for managing the database connection
-//! - `use_subscription()` hook for subscribing to queries
-//!
-//! # Example usage
-//!
-//! ```rust,ignore
-//! use dioxus::prelude::*;
-//! use module_bindings::dioxus::*;
-//!
-//! fn App() -> Element {
-//!     // Connect to the database - this sets up the connection context
-//!     let connection = use_spacetimedb_connection("http://localhost:3000", "my-module");
-//!     
-//!     // Subscribe to tables
-//!     use_subscription(&["SELECT * FROM user", "SELECT * FROM message"]);
-//!     
-//!     // Get reactive access to table data
-//!     let users = use_table_user();
-//!     
-//!     // Call reducers
-//!     let send_message = use_reducer_send_message();
-//!     
-//!     rsx! {
-//!         for user in users.read().iter() {
-//!             div { "{user.name}" }
-//!         }
-//!         button {
-//!             onclick: move |_| send_message("Hello, world!".to_string()),
-//!             "Send Message"
-//!         }
-//!     }
-//! }
-//! ```
+//! - `use_spacetimedb_context_provider` — Root-level hook that establishes the connection
+//!   and creates `SyncSignal`s for all tables.
+//! - `use_table_*` — Per-table hooks returning `SyncSignal<Vec<Row>>`.
+//! - `use_reducer_*` — Per-reducer hooks returning callable closures.
+//! - `use_subscription` — Hook for subscribing to SQL queries.
+//! - Connection state hooks for monitoring connection status.
 
 use super::code_indenter::{CodeIndenter, Indenter};
+use crate::rust::type_name;
 use crate::util::{
-    is_reducer_invokable, iter_procedures, iter_reducers, iter_table_names_and_types,
-    print_auto_generated_file_comment, print_auto_generated_version_comment, print_lines, type_ref_name,
-    CodegenVisibility,
+    is_reducer_invokable, iter_reducers, iter_table_names_and_types, iter_tables, print_auto_generated_file_comment,
+    print_auto_generated_version_comment, type_ref_name, CodegenVisibility,
 };
 use crate::{CodegenOptions, Lang, OutputFile};
-use crate::rust::type_name;
 use convert_case::{Case, Casing};
-use spacetimedb_lib::sats::AlgebraicTypeRef;
 use spacetimedb_schema::def::{ModuleDef, ProcedureDef, ReducerDef, TableDef, TypeDef};
-use spacetimedb_schema::identifier::Identifier;
 use spacetimedb_schema::schema::TableSchema;
 use std::ops::Deref;
 
 const INDENT: &str = "    ";
 
-/// Dioxus code generator for SpacetimeDB.
-///
-/// This generator produces Dioxus-compatible hooks and signals alongside the standard Rust SDK types.
-/// It reuses the existing Rust type definitions and adds a `dioxus` submodule with reactive wrappers.
 pub struct Dioxus;
 
 impl Lang for Dioxus {
     fn generate_type_files(&self, module: &ModuleDef, typ: &TypeDef) -> Vec<OutputFile> {
-        // Reuse the Rust type generation - types are the same
         crate::rust::Rust.generate_type_files(module, typ)
     }
 
     fn generate_table_file_from_schema(&self, module: &ModuleDef, table: &TableDef, schema: TableSchema) -> OutputFile {
-        // Reuse the Rust table generation - tables are the same
         crate::rust::Rust.generate_table_file_from_schema(module, table, schema)
     }
 
     fn generate_reducer_file(&self, module: &ModuleDef, reducer: &ReducerDef) -> OutputFile {
-        // Reuse the Rust reducer generation - reducers are the same
         crate::rust::Rust.generate_reducer_file(module, reducer)
     }
 
     fn generate_procedure_file(&self, module: &ModuleDef, procedure: &ProcedureDef) -> OutputFile {
-        // Reuse the Rust procedure generation - procedures are the same
         crate::rust::Rust.generate_procedure_file(module, procedure)
     }
 
     fn generate_global_files(&self, module: &ModuleDef, options: &CodegenOptions) -> Vec<OutputFile> {
-        // Generate the standard mod.rs
         let mut files = crate::rust::Rust.generate_global_files(module, options);
+        files.push(generate_dioxus_hooks(module, options.visibility));
 
-        // Add the Dioxus-specific module
-        files.push(generate_dioxus_module(module, options.visibility));
-
-        // Modify mod.rs to include the dioxus module
+        // Inject `pub mod dioxus;` into mod.rs
         if let Some(mod_file) = files.iter_mut().find(|f| f.filename == "mod.rs") {
-            // Insert the dioxus module declaration before the first type module
-            let dioxus_decl = "\npub mod dioxus;\n";
-            // Find the location after the imports but before other module declarations
             if let Some(pos) = mod_file.code.find("\npub mod ") {
-                mod_file.code.insert_str(pos, dioxus_decl);
-            } else {
-                // If no other modules, just append
-                mod_file.code.push_str(dioxus_decl);
+                mod_file.code.insert_str(pos, "\npub mod dioxus;\n");
             }
         }
 
@@ -108,93 +58,242 @@ impl Lang for Dioxus {
     }
 }
 
-fn generate_dioxus_module(module: &ModuleDef, visibility: CodegenVisibility) -> OutputFile {
+/// Collect table metadata for code generation.
+struct TableInfo {
+    /// snake_case accessor name (e.g. "todo")
+    accessor_snake: String,
+    /// PascalCase row type name (e.g. "Todo")
+    row_type: String,
+    /// Whether the table has a primary key (enables on_update callback)
+    has_primary_key: bool,
+}
+
+fn collect_tables(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<TableInfo> {
+    let tables_with_pk: std::collections::HashSet<String> = iter_tables(module, visibility)
+        .filter(|t| t.primary_key.is_some())
+        .map(|t| t.accessor_name.deref().to_string())
+        .collect();
+
+    iter_table_names_and_types(module, visibility)
+        .map(|(_, accessor_name, product_type_ref)| {
+            let accessor_snake = accessor_name.deref().to_case(Case::Snake);
+            let row_type = type_ref_name(module, product_type_ref);
+            let has_primary_key = tables_with_pk.contains(accessor_name.deref());
+            TableInfo {
+                accessor_snake,
+                row_type,
+                has_primary_key,
+            }
+        })
+        .collect()
+}
+
+/// Collect reducer metadata for code generation.
+struct ReducerInfo {
+    /// snake_case name (e.g. "add_todo")
+    name_snake: String,
+    /// Original reducer name
+    name_orig: String,
+    /// Parameter list formatted as "name: Type, name: Type"
+    arglist: String,
+    /// Parameter names formatted as "name, name"
+    arg_names: String,
+    /// Closure parameter list formatted as "name: Type, name: Type"
+    closure_params: String,
+    /// Fn trait parameter list (types only) formatted as "Type, Type"
+    fn_trait_params: String,
+}
+
+fn collect_reducers(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<ReducerInfo> {
+    iter_reducers(module, visibility)
+        .filter(|r| is_reducer_invokable(r))
+        .map(|reducer| {
+            let name_snake = reducer.name.deref().to_case(Case::Snake);
+            let name_orig = reducer.name.deref().to_string();
+
+            let mut arglist = String::new();
+            let mut arg_names = String::new();
+            let mut closure_params = String::new();
+            let mut fn_trait_params = String::new();
+
+            for (i, (arg_ident, arg_ty)) in reducer.params_for_generate.elements.iter().enumerate() {
+                let arg_name = arg_ident.deref().to_case(Case::Snake);
+                let arg_type = type_name(module, arg_ty);
+
+                if i > 0 {
+                    arglist.push_str(", ");
+                    arg_names.push_str(", ");
+                    closure_params.push_str(", ");
+                    fn_trait_params.push_str(", ");
+                }
+                arglist.push_str(&format!("{arg_name}: {arg_type}"));
+                arg_names.push_str(&arg_name);
+                closure_params.push_str(&format!("{arg_name}: {arg_type}"));
+                fn_trait_params.push_str(&arg_type.to_string());
+            }
+
+            ReducerInfo {
+                name_snake,
+                name_orig,
+                arglist,
+                arg_names,
+                closure_params,
+                fn_trait_params,
+            }
+        })
+        .collect()
+}
+
+fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> OutputFile {
+    let tables = collect_tables(module, visibility);
+    let reducers = collect_reducers(module, visibility);
+
     let mut output = CodeIndenter::new(String::new(), INDENT);
     let out = &mut output;
 
-    print_file_header(out, true);
+    print_auto_generated_file_comment(out);
+    print_auto_generated_version_comment(out);
+    writeln!(out, "#![allow(unused, clippy::all)]");
+    writeln!(out);
 
-    out.newline();
+    // Module doc
+    writeln!(out, "//! Dioxus v0.7 signals and hooks for SpacetimeDB integration.");
+    writeln!(out);
 
-    // Documentation for the module
+    // Imports
+    writeln!(out, "use super::*;");
+    writeln!(out, "use ::dioxus::prelude::*;");
+    writeln!(out, "use ::dioxus::signals::SyncSignal;");
+    writeln!(out, "use spacetimedb_sdk::{{DbContext, Table, TableWithPrimaryKey}};");
+    writeln!(out, "use std::sync::Arc;");
+    writeln!(out);
+
+    // SharedConnection type alias
+    writeln!(out, "/// Thread-safe wrapper for the database connection.");
+    writeln!(out, "pub type SharedConnection = Arc<DbConnection>;");
+    writeln!(out);
+
+    // TableSignals struct
+    writeln!(out, "/// Container for all table signals, created at root level.");
+    writeln!(out, "#[derive(Clone, Copy)]");
+    writeln!(out, "pub struct TableSignals {{");
+    for table in &tables {
+        writeln!(
+            out,
+            "    pub {}: SyncSignal<Vec<{}>>,",
+            table.accessor_snake, table.row_type
+        );
+    }
+    writeln!(out, "}}");
+    writeln!(out);
+
+    // SpacetimeDbContext struct
+    writeln!(out, "/// Internal state for managing the SpacetimeDB connection.");
+    writeln!(out, "#[derive(Clone, Copy)]");
+    writeln!(out, "pub struct SpacetimeDbContext {{");
     writeln!(
         out,
-        r#"//! Dioxus signals and hooks for SpacetimeDB integration.
-//!
-//! This module provides reactive Dioxus hooks and signals for working with SpacetimeDB.
-//!
-//! # Quick Start
-//!
-//! ```rust,ignore
-//! use dioxus::prelude::*;
-//! use crate::module_bindings::dioxus::*;
-//!
-//! fn App() -> Element {{
-//!     // Initialize the SpacetimeDB context at the root of your app
-//!     // This creates all table signals at the root level to avoid lifetime issues
-//!     use_spacetimedb_context_provider("http://localhost:3000", "my-module");
-//!
-//!     rsx! {{ Child {{}} }}
-//! }}
-//!
-//! fn Child() -> Element {{
-//!     // Use reactive table data - the signal is retrieved from root context
-//!     let users = use_table_user();
-//!
-//!     rsx! {{
-//!         for user in users.read().iter() {{
-//!             div {{ "{{user.name}}" }}
-//!         }}
-//!     }}
-//! }}
-//! ```
-"#
+        "    /// The database connection (wrapped in Arc for thread-safety)."
     );
+    writeln!(out, "    pub connection: SyncSignal<Option<SharedConnection>>,");
+    writeln!(out, "    /// The current connection state.");
+    writeln!(out, "    pub state: SyncSignal<ConnectionState>,");
+    writeln!(out, "    /// Error from the last connection attempt, if any.");
+    writeln!(out, "    pub error: SyncSignal<Option<String>>,");
+    writeln!(out, "    /// All table signals, created at root level.");
+    writeln!(out, "    pub tables: TableSignals,");
+    writeln!(out, "}}");
+    writeln!(out);
 
-    out.newline();
+    // ConnectionState enum
+    writeln!(out, "/// The current state of the SpacetimeDB connection.");
+    writeln!(out, "#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]");
+    writeln!(out, "pub enum ConnectionState {{");
+    writeln!(out, "    #[default]");
+    writeln!(out, "    Disconnected,");
+    writeln!(out, "    Connecting,");
+    writeln!(out, "    Connected,");
+    writeln!(out, "    Error,");
+    writeln!(out, "}}");
+    writeln!(out);
 
-    // Print imports
-    print_dioxus_imports(out);
+    // use_spacetimedb_context_provider
+    write_context_provider(out, &tables);
+    writeln!(out);
 
-    out.newline();
+    // use_spacetimedb_context
+    writeln!(out, "/// Get the SpacetimeDB context from a parent component.");
+    writeln!(out, "#[must_use]");
+    writeln!(out, "pub fn use_spacetimedb_context() -> SpacetimeDbContext {{");
+    writeln!(out, "    use_context::<SpacetimeDbContext>()");
+    writeln!(out, "}}");
+    writeln!(out);
 
-    // Generate the table signals context struct (holds all table signals)
-    generate_table_signals_context(module, out, visibility);
+    // use_connection
+    writeln!(out, "/// Get the current database connection, if connected.");
+    writeln!(out, "#[must_use]");
+    writeln!(
+        out,
+        "pub fn use_connection() -> SyncSignal<Option<SharedConnection>> {{"
+    );
+    writeln!(out, "    let ctx = use_spacetimedb_context();");
+    writeln!(out, "    ctx.connection");
+    writeln!(out, "}}");
+    writeln!(out);
 
-    out.newline();
+    // use_subscription
+    write_subscription_hook(out);
+    writeln!(out);
 
-    // Generate the SpacetimeDB context provider hook
-    generate_context_provider_hook(module, out, visibility);
-
-    out.newline();
-
-    // Generate the subscription hook
-    generate_subscription_hook(out);
-
-    out.newline();
-
-    // Generate table-specific hooks (now just retrieve from context)
-    for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
-        generate_table_hook(module, out, accessor_name, product_type_ref);
-        out.newline();
+    // Table hooks
+    writeln!(out, "// --- Table hooks ---");
+    writeln!(out);
+    for table in &tables {
+        writeln!(
+            out,
+            "/// Get a reactive signal containing all rows of the `{}` table.",
+            table.accessor_snake,
+        );
+        writeln!(out, "#[must_use]");
+        writeln!(
+            out,
+            "pub fn use_table_{}() -> SyncSignal<Vec<{}>> {{",
+            table.accessor_snake, table.row_type,
+        );
+        writeln!(out, "    let ctx = use_spacetimedb_context();");
+        writeln!(out, "    ctx.tables.{}", table.accessor_snake);
+        writeln!(out, "}}");
+        writeln!(out);
     }
 
-    // Generate reducer hooks
-    for reducer in iter_reducers(module, visibility) {
-        if is_reducer_invokable(reducer) {
-            generate_reducer_hook(module, out, reducer);
-            out.newline();
-        }
+    // Reducer hooks
+    writeln!(out, "// --- Reducer hooks ---");
+    writeln!(out);
+    for reducer in &reducers {
+        write_reducer_hook(out, reducer);
+        writeln!(out);
     }
 
-    // Generate procedure hooks
-    for procedure in iter_procedures(module, visibility) {
-        generate_procedure_hook(module, out, procedure);
-        out.newline();
-    }
+    // Connection state hooks
+    writeln!(out, "// --- Connection state hooks ---");
+    writeln!(out);
+    writeln!(out, "/// Get a reactive signal for the current connection state.");
+    writeln!(out, "#[must_use]");
+    writeln!(out, "pub fn use_connection_state() -> SyncSignal<ConnectionState> {{");
+    writeln!(out, "    let ctx = use_spacetimedb_context();");
+    writeln!(out, "    ctx.state");
+    writeln!(out, "}}");
+    writeln!(out);
 
-    // Generate the connection state signal
-    generate_connection_state(out);
+    writeln!(
+        out,
+        "/// Get a reactive signal for the current connection error, if any."
+    );
+    writeln!(out, "#[must_use]");
+    writeln!(out, "pub fn use_connection_error() -> SyncSignal<Option<String>> {{");
+    writeln!(out, "    let ctx = use_spacetimedb_context();");
+    writeln!(out, "    ctx.error");
+    writeln!(out, "}}");
 
     OutputFile {
         filename: "dioxus.rs".to_string(),
@@ -202,581 +301,217 @@ fn generate_dioxus_module(module: &ModuleDef, visibility: CodegenVisibility) -> 
     }
 }
 
-const ALLOW_LINTS: &str = "#![allow(unused, clippy::all)]";
-
-const DIOXUS_IMPORTS: &[&str] = &[
-    "use ::dioxus::prelude::*;",
-    "use ::dioxus::signals::SyncSignal;",
-    "use std::sync::Arc;",
-    "use super::*;",
-    "use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey};",
-    "use spacetimedb_sdk::__codegen::{",
-    "\tself as __sdk,",
-    "\t__lib,",
-    "\t__sats,",
-    "\t__ws,",
-    "};",
-    "",
-    "/// Thread-safe wrapper for the database connection.",
-    "/// We use SyncSignal (Signal with SyncStorage) for thread-safe access from SpacetimeDB callbacks.",
-    "pub type SharedConnection = Arc<DbConnection>;",
-];
-
-fn print_dioxus_imports(output: &mut Indenter) {
-    print_lines(output, DIOXUS_IMPORTS);
-}
-
-fn print_file_header(output: &mut Indenter, include_version: bool) {
-    print_auto_generated_file_comment(output);
-    if include_version {
-        print_auto_generated_version_comment(output);
-    }
-    writeln!(output, "{ALLOW_LINTS}");
-}
-
-fn table_signal_field_name(accessor_name: &Identifier) -> String {
-    accessor_name.deref().to_case(Case::Snake)
-}
-
-fn generate_table_signals_context(module: &ModuleDef, out: &mut Indenter, visibility: CodegenVisibility) {
-    // Generate the struct that holds all table signals
-    writeln!(out, "/// Container for all table signals, created at root level.");
+fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(
         out,
-        "/// This ensures signals outlive any child components that use them."
+        "/// Initialize the SpacetimeDB context provider at the root of your application."
     );
-    writeln!(out, "#[derive(Clone, Copy)]");
-    writeln!(out, "pub struct TableSignals {{");
-    out.indent(1);
+    writeln!(out, "///");
+    writeln!(
+        out,
+        "/// This hook must be called at the root component before using any other SpacetimeDB hooks."
+    );
+    writeln!(
+        out,
+        "/// It creates all table signals at root level to ensure they outlive child components."
+    );
+    writeln!(out, "#[must_use]");
+    writeln!(
+        out,
+        "pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> SpacetimeDbContext {{"
+    );
+    writeln!(out, "    let uri = uri.to_string();");
+    writeln!(out, "    let module_name = module_name.to_string();");
+    writeln!(out);
+    writeln!(
+        out,
+        "    let connection: SyncSignal<Option<SharedConnection>> = use_signal_sync(|| None);"
+    );
+    writeln!(
+        out,
+        "    let state: SyncSignal<ConnectionState> = use_signal_sync(|| ConnectionState::Disconnected);"
+    );
+    writeln!(
+        out,
+        "    let error: SyncSignal<Option<String>> = use_signal_sync(|| None);"
+    );
+    writeln!(out);
+    writeln!(out, "    let mut table_signals = TableSignals {{");
+    for table in tables {
+        writeln!(out, "        {}: use_signal_sync(Vec::new),", table.accessor_snake);
+    }
+    writeln!(out, "    }};");
+    writeln!(out);
+    writeln!(out, "    let ctx = SpacetimeDbContext {{");
+    writeln!(out, "        connection,");
+    writeln!(out, "        state,");
+    writeln!(out, "        error,");
+    writeln!(out, "        tables: table_signals,");
+    writeln!(out, "    }};");
+    writeln!(out);
+    writeln!(out, "    use_context_provider(|| ctx);");
+    writeln!(out);
 
-    for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
-        let row_type = type_ref_name(module, product_type_ref);
-        let field_name = table_signal_field_name(accessor_name);
-        writeln!(out, "pub {field_name}: SyncSignal<Vec<{row_type}>>,");
+    // use_effect for connection setup
+    writeln!(out, "    use_effect(move || {{");
+    writeln!(out, "        let mut connection = connection;");
+    writeln!(out, "        let mut state = state;");
+    writeln!(out, "        let mut error = error;");
+    writeln!(out, "        let uri = uri.clone();");
+    writeln!(out, "        let module_name = module_name.clone();");
+    writeln!(out);
+    writeln!(out, "        state.set(ConnectionState::Connecting);");
+    writeln!(out);
+    writeln!(out, "        spawn(async move {{");
+    writeln!(out, "            match DbConnection::builder()");
+    writeln!(out, "                .with_uri(&uri)");
+    writeln!(out, "                .with_database_name(&module_name)");
+    writeln!(out, "                .on_connect(move |conn, _identity, _token| {{");
+
+    // Generate on_connect body: populate initial rows and register callbacks for each table
+    for table in tables {
+        let snake = &table.accessor_snake;
+        writeln!(out, "                    // Populate initial rows for {snake}");
+        writeln!(
+            out,
+            "                    let current: Vec<{}> = conn.db.{snake}().iter().collect();",
+            table.row_type,
+        );
+        writeln!(out, "                    table_signals.{snake}.set(current);");
+        writeln!(out);
+        writeln!(out, "                    // Keep signal in sync on changes");
+        writeln!(
+            out,
+            "                    conn.db.{snake}().on_insert(move |ctx, _row| {{"
+        );
+        writeln!(
+            out,
+            "                        let updated: Vec<{}> = ctx.db.{snake}().iter().collect();",
+            table.row_type,
+        );
+        writeln!(out, "                        table_signals.{snake}.set(updated);");
+        writeln!(out, "                    }});");
+        if table.has_primary_key {
+            writeln!(
+                out,
+                "                    conn.db.{snake}().on_update(move |ctx, _old, _new| {{"
+            );
+            writeln!(
+                out,
+                "                        let updated: Vec<{}> = ctx.db.{snake}().iter().collect();",
+                table.row_type,
+            );
+            writeln!(out, "                        table_signals.{snake}.set(updated);");
+            writeln!(out, "                    }});");
+        }
+        writeln!(
+            out,
+            "                    conn.db.{snake}().on_delete(move |ctx, _row| {{"
+        );
+        writeln!(
+            out,
+            "                        let updated: Vec<{}> = ctx.db.{snake}().iter().collect();",
+            table.row_type,
+        );
+        writeln!(out, "                        table_signals.{snake}.set(updated);");
+        writeln!(out, "                    }});");
     }
 
-    out.dedent(1);
+    writeln!(out, "                }})");
+    writeln!(
+        out,
+        "                .on_disconnect(move |_ctx, err: Option<spacetimedb_sdk::Error>| {{"
+    );
+    writeln!(out, "                    if let Some(e) = err {{");
+    writeln!(out, "                        error.set(Some::<String>(e.to_string()));");
+    writeln!(out, "                        state.set(ConnectionState::Error);");
+    writeln!(out, "                    }} else {{");
+    writeln!(out, "                        state.set(ConnectionState::Disconnected);");
+    writeln!(out, "                    }}");
+    writeln!(out, "                }})");
+    writeln!(out, "                .build()");
+    writeln!(out, "            {{");
+    writeln!(out, "                Ok(conn) => {{");
+    writeln!(
+        out,
+        "                    let shared_conn: Arc<DbConnection> = Arc::new(conn);"
+    );
+    writeln!(out, "                    connection.set(Some(shared_conn.clone()));");
+    writeln!(out, "                    state.set(ConnectionState::Connected);");
+    writeln!(out);
+    writeln!(out, "                    spawn(async move {{");
+    writeln!(out, "                        let _ = shared_conn.run_async().await;");
+    writeln!(out, "                    }});");
+    writeln!(out, "                }}");
+    writeln!(out, "                Err(e) => {{");
+    writeln!(out, "                    error.set(Some::<String>(e.to_string()));");
+    writeln!(out, "                    state.set(ConnectionState::Error);");
+    writeln!(out, "                }}");
+    writeln!(out, "            }}");
+    writeln!(out, "        }});");
+    writeln!(out, "    }});");
+    writeln!(out);
+    writeln!(out, "    ctx");
     writeln!(out, "}}");
 }
 
-fn generate_context_provider_hook(module: &ModuleDef, out: &mut Indenter, visibility: CodegenVisibility) {
-    // First, build the list of table fields for initialization
-    let mut table_fields_init = String::new();
-    // We'll also build the per-table callback registrations to insert into on_connect
-    let mut table_callbacks = String::new();
-
-    for (_, accessor_name, product_type_ref) in iter_table_names_and_types(module, visibility) {
-        let field_name = table_signal_field_name(accessor_name);
-        let row_type = type_ref_name(module, product_type_ref);
-        let table_method = accessor_name.deref().to_case(Case::Snake);
-
-        // Field initialization
-        table_fields_init.push_str(&format!("        {field_name}: use_signal_sync(Vec::new),\n"));
-
-        // Callback registration for this table: populate initial rows and register insert/update/delete
-        table_callbacks.push_str(&format!(
-            r#"
-                    // Initialize and register callbacks for {accessor_name}
-                    let mut {field_name}_signal = table_signals.{field_name};
-                    // Populate initial rows
-                    let current: Vec<{row_type}> = conn.db.{table_method}().iter().collect();
-                    {field_name}_signal.set(current);
-                    // Keep in sync on changes
-                    conn.db.{table_method}().on_insert(move |ctx, _row| {{
-                        let updated: Vec<{row_type}> = ctx.db.{table_method}().iter().collect();
-                        {field_name}_signal.set(updated);
-                    }});
-                    conn.db.{table_method}().on_update(move |ctx, _old, _new| {{
-                        let updated: Vec<{row_type}> = ctx.db.{table_method}().iter().collect();
-                        {field_name}_signal.set(updated);
-                    }});
-                    conn.db.{table_method}().on_delete(move |ctx, _row| {{
-                        let updated: Vec<{row_type}> = ctx.db.{table_method}().iter().collect();
-                        {field_name}_signal.set(updated);
-                    }});
-"#
-        ));
-    }
-
-    write!(
+fn write_subscription_hook(out: &mut Indenter) {
+    writeln!(out, "/// Subscribe to a set of SQL queries.");
+    writeln!(out, "pub fn use_subscription(queries: &[&str]) {{");
+    writeln!(
         out,
-        "{}",
-        format!(
-            r#"/// Internal state for managing the SpacetimeDB connection.
-/// Uses SyncSignal for thread-safe access from SpacetimeDB callbacks.
-#[derive(Clone, Copy)]
-pub struct SpacetimeDbContext {{
-    /// The database connection (wrapped in Arc for thread-safety).
-    pub connection: SyncSignal<Option<SharedConnection>>,
-    /// The current connection state.
-    pub state: SyncSignal<ConnectionState>,
-    /// Error from the last connection attempt, if any.
-    pub error: SyncSignal<Option<String>>,
-    /// All table signals, created at root level.
-    pub tables: TableSignals,
-}}
-
-/// The current state of the SpacetimeDB connection.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum ConnectionState {{
-    /// Not connected to the database.
-    #[default]
-    Disconnected,
-    /// Currently attempting to connect.
-    Connecting,
-    /// Successfully connected to the database.
-    Connected,
-    /// An error occurred during connection or while connected.
-    Error,
-}}
-
-/// Initialize the SpacetimeDB context provider at the root of your application.
-///
-/// This hook must be called at the root component of your application before using
-/// any other SpacetimeDB hooks. It establishes the database connection and provides
-/// the context for all child components.
-///
-/// **Important:** All table signals are created here at the root level to ensure
-/// they outlive any child components that use them. This prevents issues with
-/// SpacetimeDB callbacks trying to access dropped signals.
-///
-/// # Arguments
-///
-/// * `uri` - The URI of the SpacetimeDB host (e.g., "http://localhost:3000")
-/// * `module_name` - The name of the module to connect to
-///
-/// # Returns
-///
-/// A `SpacetimeDbContext` that can be used to access connection state.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn App() -> Element {{
-///     let ctx = use_spacetimedb_context_provider("http://localhost:3000", "my-module");
-///
-///     match ctx.state() {{
-///         ConnectionState::Connected => rsx! {{ Child {{}} }},
-///         ConnectionState::Connecting => rsx! {{ "Connecting..." }},
-///         ConnectionState::Disconnected => rsx! {{ "Disconnected" }},
-///         ConnectionState::Error => rsx! {{ "Error: {{ctx.error().unwrap_or_default()}}" }},
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str) -> SpacetimeDbContext {{
-    let uri = uri.to_string();
-    let module_name = module_name.to_string();
-
-    // Use SyncSignal for thread-safe access from SpacetimeDB callbacks
-    let connection: SyncSignal<Option<SharedConnection>> = use_signal_sync(|| None);
-    let state: SyncSignal<ConnectionState> = use_signal_sync(|| ConnectionState::Disconnected);
-    let error: SyncSignal<Option<String>> = use_signal_sync(|| None);
-    
-    // Create all table signals at root level - this is crucial!
-    // These signals must outlive any child components that use them.
-    let table_signals = TableSignals {{
-{table_fields_init}    }};
-
-    let ctx = SpacetimeDbContext {{
-        connection,
-        state,
-        error,
-        tables: table_signals,
-    }};
-
-    // Provide the context to child components
-    use_context_provider(|| ctx);
-
-    // Connect on first render
-    use_effect(move || {{
-        let mut connection = connection;
-        let mut state = state;
-        let mut error = error;
-        let uri = uri.clone();
-        let module_name = module_name.clone();
-
-        state.set(ConnectionState::Connecting);
-
-        spawn(async move {{
-            match DbConnection::builder()
-                .with_uri(&uri)
-                .with_module_name(&module_name)
-                .on_connect(move |conn, _identity, _token| {{
-                    // Initialize table signals with current data and register callbacks
-{table_callbacks}
-                }})
-                .on_disconnect(move |_ctx, err| {{
-                    // SyncSignal is Send + Sync, so we can safely update from callbacks
-                    if let Some(e) = err {{
-                        error.set(Some(e.to_string()));
-                        state.set(ConnectionState::Error);
-                    }} else {{
-                        state.set(ConnectionState::Disconnected);
-                    }}
-                }})
-                .build()
-            {{
-                Ok(conn) => {{
-                    let shared_conn = Arc::new(conn);
-                    connection.set(Some(shared_conn.clone()));
-                    state.set(ConnectionState::Connected);
-
-                    // Run the connection in a background task
-                    spawn(async move {{
-                        let _ = shared_conn.run_async().await;
-                    }});
-                }}
-                Err(e) => {{
-                    error.set(Some(e.to_string()));
-                    state.set(ConnectionState::Error);
-                }}
-            }}
-        }});
-    }});
-
-    ctx
-}}
-
-/// Get the SpacetimeDB context from a parent component.
-///
-/// This hook retrieves the SpacetimeDB context that was set up by `use_spacetimedb_context_provider`.
-/// It must be called in a component that is a descendant of a component that called
-/// `use_spacetimedb_context_provider`.
-///
-/// # Panics
-///
-/// Panics if called outside of a component tree that has a `use_spacetimedb_context_provider`.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn Child() -> Element {{
-///     let ctx = use_spacetimedb_context();
-///
-///     if ctx.state() == ConnectionState::Connected {{
-///         // Use the connection
-///     }}
-///
-///     rsx! {{ "Connection state: {{ctx.state():?}}" }}
-/// }}
-/// ```
-#[must_use]
-pub fn use_spacetimedb_context() -> SpacetimeDbContext {{
-    use_context::<SpacetimeDbContext>()
-}}
-
-/// Get the current database connection, if connected.
-///
-/// Returns `None` if not yet connected.
-#[must_use]
-pub fn use_connection() -> SyncSignal<Option<SharedConnection>> {{
-    let ctx = use_spacetimedb_context();
-    ctx.connection
-}}
-            "#,
-            table_fields_init = table_fields_init,
-            table_callbacks = table_callbacks
-        )
+        "    let queries: Vec<String> = queries.iter().map(|s| s.to_string()).collect();"
     );
+    writeln!(out, "    let conn_signal = use_connection();");
+    writeln!(out);
+    writeln!(out, "    use_effect(move || {{");
+    writeln!(out, "        let queries = queries.clone();");
+    writeln!(out, "        if let Some(conn) = conn_signal.read().as_ref() {{");
+    writeln!(out, "            conn.subscription_builder()");
+    writeln!(out, "                .on_applied(|_ctx| {{}})");
+    writeln!(out, "                .on_error(|_ctx, _err| {{}})");
+    writeln!(out, "                .subscribe(queries);");
+    writeln!(out, "        }}");
+    writeln!(out, "    }});");
+    writeln!(out, "}}");
 }
 
-fn generate_subscription_hook(out: &mut Indenter) {
-    write!(
-        out,
-        r#"/// Subscribe to a set of SQL queries.
-///
-/// This hook subscribes to the given SQL queries and keeps the local cache in sync
-/// with the database. The queries will be executed on the server and any matching
-/// rows will be replicated to the client.
-///
-/// # Arguments
-///
-/// * `queries` - A slice of SQL query strings to subscribe to
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn MyComponent() -> Element {{
-///     // Subscribe to all users and messages
-///     use_subscription(&["SELECT * FROM user", "SELECT * FROM message"]);
-///
-///     // Now you can use table hooks to access the data
-///     let users = use_table_user();
-///     // ...
-/// }}
-/// ```
-pub fn use_subscription(queries: &[&str]) {{
-    let queries: Vec<String> = queries.iter().map(|s| s.to_string()).collect();
-    let conn_signal = use_connection();
+fn write_reducer_hook(out: &mut Indenter, reducer: &ReducerInfo) {
+    writeln!(out, "/// Get a callback to invoke the `{}` reducer.", reducer.name_orig,);
+    writeln!(out, "#[must_use]");
 
-    use_effect(move || {{
-        let queries = queries.clone();
-        if let Some(conn) = conn_signal.read().as_ref() {{
-            conn.subscription_builder()
-                .on_applied(|_ctx| {{
-                    // Subscription applied successfully
-                }})
-                .on_error(|_ctx, _err| {{
-                    // Handle subscription error
-                }})
-                .subscribe(queries);
-        }}
-    }});
-}}
-"#
-    );
-}
-
-fn table_hook_name(accessor_name: &Identifier) -> String {
-    format!("use_table_{}", accessor_name.deref().to_case(Case::Snake))
-}
-
-fn generate_table_hook(
-    module: &ModuleDef,
-    out: &mut Indenter,
-    accessor_name: &Identifier,
-    product_type_ref: AlgebraicTypeRef,
-) {
-    let row_type = type_ref_name(module, product_type_ref);
-    let hook_name = table_hook_name(accessor_name);
-    let field_name = table_signal_field_name(accessor_name);
-
-    write!(
-        out,
-        r#"/// Get a reactive signal containing all rows of the `{accessor_name}` table.
-///
-/// This hook returns a signal that automatically updates when the `{accessor_name}` table changes.
-/// The signal contains a `Vec` of all `{row_type}` rows currently in the local cache.
-///
-/// The signal is created at root level by `use_spacetimedb_context_provider` and retrieved
-/// here from the context, ensuring it outlives any child components.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn {row_type}List() -> Element {{
-///     let items = {hook_name}();
-///
-///     rsx! {{
-///         for item in items.read().iter() {{
-///             div {{ "{{item:?}}" }}
-///         }}
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn {hook_name}() -> SyncSignal<Vec<{row_type}>> {{
-    let ctx = use_spacetimedb_context();
-    ctx.tables.{field_name}
-}}
-"#
-    );
-}
-
-fn reducer_hook_name(reducer: &ReducerDef) -> String {
-    format!("use_reducer_{}", reducer.name.deref().to_case(Case::Snake))
-}
-
-fn generate_reducer_hook(module: &ModuleDef, out: &mut Indenter, reducer: &ReducerDef) {
-    let hook_name = reducer_hook_name(reducer);
-    let reducer_name = reducer.name.deref();
-    let func_name = reducer.name.deref().to_case(Case::Snake);
-
-    // Build the argument list for the closure (with names) and for the trait bound (types only)
-    let mut args_decl = String::new();
-    let mut args_types = String::new();
-    let mut args_call = String::new();
-    for (i, (arg_name, arg_ty)) in reducer.params_for_generate.elements.iter().enumerate() {
-        let name = arg_name.deref().to_case(Case::Snake);
-        let ty = type_name(module, arg_ty);
-        if i > 0 {
-            args_decl.push_str(", ");
-            args_types.push_str(", ");
-            args_call.push_str(", ");
-        }
-        args_decl.push_str(&format!("{name}: {ty}"));
-        args_types.push_str(&ty);
-        args_call.push_str(&name);
-    }
-
-    // Generate appropriate callback signature (types only in trait bound)
-    let callback_sig = if reducer.params_for_generate.elements.is_empty() {
-        "impl Fn() + Clone + 'static".to_string()
+    if reducer.arglist.is_empty() {
+        // No-argument reducer
+        writeln!(
+            out,
+            "pub fn use_reducer_{}() -> impl Fn() + Clone + 'static {{",
+            reducer.name_snake,
+        );
+        writeln!(out, "    let conn_signal = use_connection();");
+        writeln!(out);
+        writeln!(out, "    move || {{");
+        writeln!(out, "        if let Some(conn) = conn_signal.read().as_ref() {{",);
+        writeln!(out, "            let _ = conn.reducers.{}();", reducer.name_snake);
+        writeln!(out, "        }}");
+        writeln!(out, "    }}");
     } else {
-        format!("impl Fn({args_types}) + Clone + 'static")
-    };
-
-    write!(
-        out,
-        r#"/// Get a callback to invoke the `{reducer_name}` reducer.
-///
-/// This hook returns a callback that can be used to call the `{reducer_name}` reducer.
-/// The callback is Clone and can be used in event handlers.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn MyComponent() -> Element {{
-///     let {func_name} = {hook_name}();
-///
-///     rsx! {{
-///         button {{
-///             onclick: move |_| {func_name}({args_call}),
-///             "Call {reducer_name}"
-///         }}
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn {hook_name}() -> {callback_sig} {{
-    let conn_signal = use_connection();
-
-    move |{args_decl}| {{
-        if let Some(conn) = conn_signal.read().as_ref() {{
-            let _ = conn.reducers.{func_name}({args_call});
-        }}
-    }}
-}}
-"#
-    );
-}
-
-fn procedure_hook_name(procedure: &ProcedureDef) -> String {
-    format!("use_procedure_{}", procedure.name.deref().to_case(Case::Snake))
-}
-
-fn generate_procedure_hook(module: &ModuleDef, out: &mut Indenter, procedure: &ProcedureDef) {
-    let hook_name = procedure_hook_name(procedure);
-    let procedure_name = procedure.name.deref();
-    let func_name = procedure.name.deref().to_case(Case::Snake);
-
-    // Build the argument list for the closure (with names) and for the trait bound (types only)
-    let mut args_decl = String::new();
-    let mut args_types = String::new();
-    let mut args_call = String::new();
-    for (i, (arg_name, arg_ty)) in procedure.params_for_generate.elements.iter().enumerate() {
-        let name = arg_name.deref().to_case(Case::Snake);
-        let ty = type_name(module, arg_ty);
-        if i > 0 {
-            args_decl.push_str(", ");
-            args_types.push_str(", ");
-            args_call.push_str(", ");
-        }
-        args_decl.push_str(&format!("{name}: {ty}"));
-        args_types.push_str(&ty);
-        args_call.push_str(&name);
+        // Reducer with arguments
+        writeln!(
+            out,
+            "pub fn use_reducer_{}() -> impl Fn({}) + Clone + 'static {{",
+            reducer.name_snake, reducer.fn_trait_params,
+        );
+        writeln!(out, "    let conn_signal = use_connection();");
+        writeln!(out);
+        writeln!(out, "    move |{}| {{", reducer.closure_params);
+        writeln!(out, "        if let Some(conn) = conn_signal.read().as_ref() {{",);
+        writeln!(
+            out,
+            "            let _ = conn.reducers.{}({});",
+            reducer.name_snake, reducer.arg_names,
+        );
+        writeln!(out, "        }}");
+        writeln!(out, "    }}");
     }
-
-    // Generate appropriate callback signature (types only in trait bound)
-    let callback_sig = if procedure.params_for_generate.elements.is_empty() {
-        "impl Fn() + Clone + 'static".to_string()
-    } else {
-        format!("impl Fn({args_types}) + Clone + 'static")
-    };
-
-    write!(
-        out,
-        r#"/// Get a callback to invoke the `{procedure_name}` procedure.
-///
-/// This hook returns a callback that can be used to call the `{procedure_name}` procedure.
-/// The callback is Clone and can be used in event handlers.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn MyComponent() -> Element {{
-///     let {func_name} = {hook_name}();
-///
-///     rsx! {{
-///         button {{
-///             onclick: move |_| {func_name}({args_call}),
-///             "Call {procedure_name}"
-///         }}
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn {hook_name}() -> {callback_sig} {{
-    let conn_signal = use_connection();
-
-    move |{args_decl}| {{
-        if let Some(conn) = conn_signal.read().as_ref() {{
-            conn.procedures.{func_name}({args_call});
-        }}
-    }}
-}}
-"#
-    );
-}
-
-fn generate_connection_state(out: &mut Indenter) {
-    write!(
-        out,
-        r#"/// Get a reactive signal for the current connection state.
-///
-/// This hook returns a signal that automatically updates when the connection state changes.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn ConnectionStatus() -> Element {{
-///     let state = use_connection_state();
-///
-///     rsx! {{
-///         match state() {{
-///             ConnectionState::Connected => "Connected",
-///             ConnectionState::Connecting => "Connecting...",
-///             ConnectionState::Disconnected => "Disconnected",
-///             ConnectionState::Error => "Error",
-///         }}
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn use_connection_state() -> SyncSignal<ConnectionState> {{
-    let ctx = use_spacetimedb_context();
-    ctx.state
-}}
-
-/// Get a reactive signal for the current connection error, if any.
-///
-/// This hook returns a signal that automatically updates when an error occurs.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// fn ErrorDisplay() -> Element {{
-///     let error = use_connection_error();
-///
-///     rsx! {{
-///         if let Some(err) = error() {{
-///             div {{ class: "error", "Error: {{err}}" }}
-///         }}
-///     }}
-/// }}
-/// ```
-#[must_use]
-pub fn use_connection_error() -> SyncSignal<Option<String>> {{
-    let ctx = use_spacetimedb_context();
-    ctx.error
-}}
-"#
-    );
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_table_hook_name() {
-        let ident = Identifier::new("user_profile".into()).unwrap();
-        assert_eq!(table_hook_name(&ident), "use_table_user_profile");
-    }
-
-    #[test]
-    fn test_reducer_hook_name() {
-        // This is a simplified test - in practice we'd need a full ReducerDef
-    }
+    writeln!(out, "}}");
 }
