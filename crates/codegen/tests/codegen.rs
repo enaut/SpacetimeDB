@@ -1,5 +1,6 @@
 use spacetimedb_codegen::{
-    generate, generate_receiver_bindings, CodegenOptions, Csharp, ImportExtension, ReceiverLanguage, Rust, TypeScript,
+    generate, generate_receiver_bindings, CodegenOptions, Csharp, Dioxus, ImportExtension, ReceiverLanguage, Rust,
+    TypeScript,
 };
 use spacetimedb_data_structures::map::HashMap;
 use spacetimedb_schema::def::ModuleDef;
@@ -88,6 +89,7 @@ declare_tests! {
     test_codegen_csharp => Csharp { namespace: "SpacetimeDB" },
     test_codegen_typescript => TypeScript::default(),
     test_codegen_rust => Rust,
+    test_codegen_dioxus => Dioxus,
 }
 
 #[test]
