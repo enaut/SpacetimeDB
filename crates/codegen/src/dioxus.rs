@@ -38,7 +38,6 @@ fn get_type_module_name(module: &ModuleDef, type_ref: AlgebraicTypeRef) -> Strin
 /// This is a complete reimplementation that avoids name shadowing issues.
 fn generate_reducer_file_with_aliases(module: &ModuleDef, reducer: &ReducerDef) -> OutputFile {
     use std::collections::{BTreeSet, HashMap};
-    use std::fmt::Write as _;
 
     const INDENT: &str = "    ";
     const STRUCT_DERIVES: &[&str] = &[
@@ -498,7 +497,7 @@ fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> O
         out,
         "use spacetimedb_sdk::{{DbContext, Table, TableWithPrimaryKey, Identity}};"
     );
-    writeln!(out, "use std::sync::Arc;");
+    writeln!(out, "use std::sync::{{Arc, Mutex}};");
     writeln!(out);
 
     // SharedConnection type alias
@@ -545,6 +544,7 @@ fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> O
     writeln!(out, "    #[default]");
     writeln!(out, "    Disconnected,");
     writeln!(out, "    Connecting,");
+    writeln!(out, "    Reconnecting {{ attempt: u32, delay_ms: u64 }},");
     writeln!(
         out,
         "    /// Connected includes the `Identity` assigned by the server and a private access token (JWT)"
@@ -556,6 +556,9 @@ fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> O
     writeln!(out, "    Connected(Identity, String),");
     writeln!(out, "    Error,");
     writeln!(out, "}}");
+    writeln!(out);
+
+    write_reconnect_helpers(out);
     writeln!(out);
 
     // use_spacetimedb_context_provider
@@ -642,6 +645,63 @@ fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> O
     }
 }
 
+fn write_reconnect_helpers(out: &mut Indenter) {
+    writeln!(out, "const RECONNECT_BASE_DELAY_MS: u64 = 400;");
+    writeln!(out, "const RECONNECT_MAX_DELAY_MS: u64 = 10_000;");
+    writeln!(out, "const RECONNECT_JITTER_MS: u64 = 300;");
+    writeln!(out, "const MAX_RECONNECT_ATTEMPTS: u32 = 0;");
+    writeln!(out);
+    writeln!(out, "#[must_use]");
+    writeln!(out, "fn should_retry_reconnect(attempt: u32) -> bool {{");
+    writeln!(
+        out,
+        "    MAX_RECONNECT_ATTEMPTS == 0 || attempt <= MAX_RECONNECT_ATTEMPTS"
+    );
+    writeln!(out, "}}");
+    writeln!(out);
+    writeln!(out, "#[must_use]");
+    writeln!(out, "fn reconnect_delay_ms(attempt: u32) -> u64 {{");
+    writeln!(out, "    let shift = attempt.min(8);");
+    writeln!(out, "    let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);");
+    writeln!(
+        out,
+        "    let base_ms = RECONNECT_BASE_DELAY_MS.saturating_mul(factor).min(RECONNECT_MAX_DELAY_MS);"
+    );
+    writeln!(
+        out,
+        "    let jitter = (u64::from(attempt).saturating_mul(137)) % RECONNECT_JITTER_MS.max(1);"
+    );
+    writeln!(out, "    base_ms.saturating_add(jitter)");
+    writeln!(out, "}}");
+    writeln!(out);
+    writeln!(out, "fn reconnect_sleep(delay_ms: u64) {{");
+    writeln!(out, "    #[cfg(not(target_arch = \"wasm32\"))]");
+    writeln!(out, "    {{");
+    writeln!(
+        out,
+        "        std::thread::sleep(std::time::Duration::from_millis(delay_ms));"
+    );
+    writeln!(out, "    }}");
+    writeln!(out, "    #[cfg(target_arch = \"wasm32\")]");
+    writeln!(out, "    {{");
+    writeln!(out, "        let _ = delay_ms;");
+    writeln!(out, "    }}");
+    writeln!(out, "}}");
+    writeln!(out);
+    writeln!(out, "#[must_use]");
+    writeln!(
+        out,
+        "fn is_fatal_connection_error(err: &spacetimedb_sdk::Error) -> bool {{"
+    );
+    writeln!(out, "    let msg = err.to_string().to_ascii_lowercase();");
+    writeln!(out, "    msg.contains(\"unauthorized\")");
+    writeln!(out, "        || msg.contains(\"forbidden\")");
+    writeln!(out, "        || msg.contains(\"invalid credentials\")");
+    writeln!(out, "        || msg.contains(\"invalid token\")");
+    writeln!(out, "        || msg.contains(\"token expired\")");
+    writeln!(out, "}}");
+}
+
 fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(
         out,
@@ -677,6 +737,10 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "    let uri = uri.to_string();");
     writeln!(out, "    let module_name = module_name.to_string();");
     writeln!(out, "    let token = token.map(|t| t.to_string());");
+    writeln!(
+        out,
+        "    let active_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(token.clone()));"
+    );
     writeln!(out);
     writeln!(
         out,
@@ -713,18 +777,63 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "        let mut state = state;");
     writeln!(out, "        let mut error = error;");
     writeln!(out, "        let uri = uri.clone();");
-    writeln!(out, "        let mut module_name = module_name.clone();");
-    writeln!(out, "        let token = token.clone();");
-    writeln!(out, "        let mut table_signals = table_signals.clone();");
-    writeln!(out);
-    writeln!(out, "        state.set(ConnectionState::Connecting);");
+    writeln!(out, "        let module_name = module_name.clone();");
+    writeln!(out, "        let active_token = active_token.clone();");
+    writeln!(out, "        let table_signals = table_signals.clone();");
     writeln!(out);
     writeln!(out, "        spawn(async move {{");
-    writeln!(out, "            match DbConnection::builder()");
-    writeln!(out, "                .with_uri(&uri)");
-    writeln!(out, "                .with_database_name(&module_name)");
-    writeln!(out, "                .with_token(token)");
-    writeln!(out, "                .on_connect(move |conn, identity, token| {{");
+    writeln!(out, "            let mut reconnect_attempt: u32 = 0;");
+    writeln!(out);
+    writeln!(out, "            loop {{");
+    writeln!(out, "                if reconnect_attempt == 0 {{");
+    writeln!(out, "                    state.set(ConnectionState::Connecting);");
+    writeln!(out, "                }} else {{");
+    writeln!(
+        out,
+        "                    let delay_ms = reconnect_delay_ms(reconnect_attempt);"
+    );
+    writeln!(
+        out,
+        "                    state.set(ConnectionState::Reconnecting {{ attempt: reconnect_attempt, delay_ms }});"
+    );
+    writeln!(out, "                }}");
+    writeln!(out);
+    writeln!(out, "                let token_for_build = active_token");
+    writeln!(out, "                    .lock()");
+    writeln!(out, "                    .ok()");
+    writeln!(out, "                    .and_then(|token| token.clone());");
+    writeln!(out);
+    writeln!(
+        out,
+        "                let disconnect_fatal: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));"
+    );
+    writeln!(
+        out,
+        "                let disconnect_fatal_on_disconnect = disconnect_fatal.clone();"
+    );
+    writeln!(out);
+    writeln!(
+        out,
+        "                let mut connection_on_disconnect = connection.clone();"
+    );
+    writeln!(out, "                let mut state_on_disconnect = state.clone();");
+    writeln!(out, "                let mut error_on_disconnect = error.clone();");
+    writeln!(out, "                let mut state_on_connect = state.clone();");
+    writeln!(out, "                let mut error_on_connect = error.clone();");
+    writeln!(
+        out,
+        "                let mut table_signals_on_connect = table_signals.clone();"
+    );
+    writeln!(
+        out,
+        "                let active_token_on_connect = active_token.clone();"
+    );
+    writeln!(out);
+    writeln!(out, "                let conn = match DbConnection::builder()");
+    writeln!(out, "                    .with_uri(&uri)");
+    writeln!(out, "                    .with_database_name(&module_name)");
+    writeln!(out, "                    .with_token(token_for_build)");
+    writeln!(out, "                    .on_connect(move |conn, identity, token| {{");
 
     // Generate on_connect body: populate initial rows and register callbacks for each table
     for table in tables {
@@ -735,7 +844,10 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
             "                    let current: Vec<{}> = conn.db.{snake}().iter().collect();",
             table.row_type,
         );
-        writeln!(out, "                    table_signals.{snake}.set(current);");
+        writeln!(
+            out,
+            "                    table_signals_on_connect.{snake}.set(current);"
+        );
         writeln!(out);
         writeln!(out, "                    // Keep signal in sync on changes");
         writeln!(
@@ -747,7 +859,10 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
             "                        let updated: Vec<{}> = ctx.db.{snake}().iter().collect();",
             table.row_type,
         );
-        writeln!(out, "                        table_signals.{snake}.set(updated);");
+        writeln!(
+            out,
+            "                        table_signals_on_connect.{snake}.set(updated);"
+        );
         writeln!(out, "                    }});");
         if table.has_primary_key {
             writeln!(
@@ -759,7 +874,10 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
                 "                        let updated: Vec<{}> = ctx.db.{snake}().iter().collect();",
                 table.row_type,
             );
-            writeln!(out, "                        table_signals.{snake}.set(updated);");
+            writeln!(
+                out,
+                "                        table_signals_on_connect.{snake}.set(updated);"
+            );
             writeln!(out, "                    }});");
         }
         writeln!(
@@ -771,51 +889,143 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
             "                        let updated: Vec<{}> = ctx.db.{snake}().iter().collect();",
             table.row_type,
         );
-        writeln!(out, "                        table_signals.{snake}.set(updated);");
+        writeln!(
+            out,
+            "                        table_signals_on_connect.{snake}.set(updated);"
+        );
         writeln!(out, "                    }});");
     }
 
     writeln!(
         out,
-        "                    // Store the assigned Identity and private access token in state so the app"
+        "                        if let Ok(mut token_store) = active_token_on_connect.lock() {{"
     );
     writeln!(
         out,
-        "                    // can persist the token (JWT) and reuse it for future reconnections via `with_token`."
+        "                            *token_store = Some(token.to_string());"
     );
-    writeln!(
-        out,
-        "                    state.set(ConnectionState::Connected(identity, token.to_string()));"
-    );
-    writeln!(out, "                }})");
-    writeln!(
-        out,
-        "                .on_disconnect(move |_ctx, err: Option<spacetimedb_sdk::Error>| {{"
-    );
-    writeln!(out, "                    if let Some(e) = err {{");
-    writeln!(out, "                        error.set(Some::<String>(e.to_string()));");
-    writeln!(out, "                        state.set(ConnectionState::Error);");
-    writeln!(out, "                    }} else {{");
-    writeln!(out, "                        state.set(ConnectionState::Disconnected);");
-    writeln!(out, "                    }}");
-    writeln!(out, "                }})");
-    writeln!(out, "                .build()");
-    writeln!(out, "            {{");
-    writeln!(out, "                Ok(conn) => {{");
-    writeln!(
-        out,
-        "                    let shared_conn: Arc<DbConnection> = Arc::new(conn);"
-    );
-    writeln!(out, "                    connection.set(Some(shared_conn.clone()));");
+    writeln!(out, "                        }}");
     writeln!(out);
-    writeln!(out, "                    spawn(async move {{");
-    writeln!(out, "                        let _ = shared_conn.run_async().await;");
-    writeln!(out, "                    }});");
-    writeln!(out, "                }}");
-    writeln!(out, "                Err(e) => {{");
-    writeln!(out, "                    error.set(Some::<String>(e.to_string()));");
+    writeln!(
+        out,
+        "                        // Store the assigned Identity and private access token in state so the app"
+    );
+    writeln!(
+        out,
+        "                        // can persist the token (JWT) and reuse it for future reconnections via `with_token`."
+    );
+    writeln!(out, "                        error_on_connect.set(None);");
+    writeln!(
+        out,
+        "                        state_on_connect.set(ConnectionState::Connected(identity, token.to_string()));"
+    );
+    writeln!(out, "                    }})");
+    writeln!(
+        out,
+        "                    .on_disconnect(move |_ctx, err: Option<spacetimedb_sdk::Error>| {{"
+    );
+    writeln!(out, "                        connection_on_disconnect.set(None);");
+    writeln!(out, "                        if let Some(e) = err {{");
+    writeln!(
+        out,
+        "                            error_on_disconnect.set(Some::<String>(e.to_string()));"
+    );
+    writeln!(out, "                            if is_fatal_connection_error(&e) {{");
+    writeln!(
+        out,
+        "                                if let Ok(mut fatal) = disconnect_fatal_on_disconnect.lock() {{"
+    );
+    writeln!(out, "                                    *fatal = true;");
+    writeln!(out, "                                }}");
+    writeln!(out, "                            }}");
+    writeln!(out, "                        }}");
+    writeln!(
+        out,
+        "                        state_on_disconnect.set(ConnectionState::Disconnected);"
+    );
+    writeln!(out, "                    }})");
+    writeln!(out, "                    .build() {{");
+    writeln!(out, "                    Ok(conn) => conn,");
+    writeln!(out, "                    Err(e) => {{");
+    writeln!(out, "                        connection.set(None);");
+    writeln!(out, "                        error.set(Some::<String>(e.to_string()));");
+    writeln!(out, "                        if is_fatal_connection_error(&e) {{");
+    writeln!(out, "                            state.set(ConnectionState::Error);");
+    writeln!(out, "                            break;");
+    writeln!(out, "                        }}");
+    writeln!(
+        out,
+        "                        reconnect_attempt = reconnect_attempt.saturating_add(1);"
+    );
+    writeln!(
+        out,
+        "                        if !should_retry_reconnect(reconnect_attempt) {{"
+    );
+    writeln!(out, "                            state.set(ConnectionState::Error);");
+    writeln!(out, "                            break;");
+    writeln!(out, "                        }}");
+    writeln!(
+        out,
+        "                        let delay_ms = reconnect_delay_ms(reconnect_attempt);"
+    );
+    writeln!(
+        out,
+        "                        state.set(ConnectionState::Reconnecting {{ attempt: reconnect_attempt, delay_ms }});"
+    );
+    writeln!(out, "                        reconnect_sleep(delay_ms);");
+    writeln!(out, "                        continue;");
+    writeln!(out, "                    }}");
+    writeln!(out, "                }};");
+    writeln!(out);
+    writeln!(
+        out,
+        "                let shared_conn: Arc<DbConnection> = Arc::new(conn);"
+    );
+    writeln!(out, "                connection.set(Some(shared_conn.clone()));");
+    writeln!(out, "                reconnect_attempt = 0;");
+    writeln!(out);
+    writeln!(out, "                let run_result = shared_conn.run_async().await;");
+    writeln!(out, "                connection.set(None);");
+    writeln!(out);
+    writeln!(
+        out,
+        "                let disconnected_with_fatal_error = disconnect_fatal"
+    );
+    writeln!(out, "                    .lock()");
+    writeln!(out, "                    .ok()");
+    writeln!(out, "                    .map(|fatal| *fatal)");
+    writeln!(out, "                    .unwrap_or(false);");
+    writeln!(out, "                if disconnected_with_fatal_error {{");
     writeln!(out, "                    state.set(ConnectionState::Error);");
+    writeln!(out, "                    break;");
     writeln!(out, "                }}");
+    writeln!(out);
+    writeln!(out, "                if let Err(e) = run_result {{");
+    writeln!(out, "                    error.set(Some::<String>(e.to_string()));");
+    writeln!(out, "                    if is_fatal_connection_error(&e) {{");
+    writeln!(out, "                        state.set(ConnectionState::Error);");
+    writeln!(out, "                        break;");
+    writeln!(out, "                    }}");
+    writeln!(out, "                }}");
+    writeln!(out);
+    writeln!(
+        out,
+        "                reconnect_attempt = reconnect_attempt.saturating_add(1);"
+    );
+    writeln!(out, "                if !should_retry_reconnect(reconnect_attempt) {{");
+    writeln!(out, "                    state.set(ConnectionState::Error);");
+    writeln!(out, "                    break;");
+    writeln!(out, "                }}");
+    writeln!(out);
+    writeln!(
+        out,
+        "                let delay_ms = reconnect_delay_ms(reconnect_attempt);"
+    );
+    writeln!(
+        out,
+        "                state.set(ConnectionState::Reconnecting {{ attempt: reconnect_attempt, delay_ms }});"
+    );
+    writeln!(out, "                reconnect_sleep(delay_ms);");
     writeln!(out, "            }}");
     writeln!(out, "        }});");
     writeln!(out, "    }});");
@@ -826,6 +1036,17 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
 
 fn write_subscription_hook(out: &mut Indenter) {
     writeln!(out, "/// Subscribe to a set of SQL queries.");
+    writeln!(out, "///");
+    writeln!(
+        out,
+        "/// Re-subscribes automatically whenever the connection instance changes"
+    );
+    writeln!(out, "/// (initial connect, or reconnect after a network interruption).");
+    writeln!(
+        out,
+        "/// Avoids duplicate subscriptions while the connection is stable."
+    );
+    writeln!(out, "/// Subscription errors are printed to stderr for diagnosis.");
     writeln!(out, "pub fn use_subscription(queries: &[&str]) {{");
     writeln!(
         out,
@@ -833,13 +1054,73 @@ fn write_subscription_hook(out: &mut Indenter) {
     );
     writeln!(out, "    let conn_signal = use_connection();");
     writeln!(out);
+    writeln!(
+        out,
+        "    // Stores the Arc pointer of the last successfully-subscribed connection."
+    );
+    writeln!(
+        out,
+        "    // Using peek() inside the effect keeps this read non-reactive (no infinite loop)."
+    );
+    writeln!(
+        out,
+        "    let last_conn: SyncSignal<Option<SharedConnection>> = use_signal_sync(|| None);"
+    );
+    writeln!(out);
     writeln!(out, "    use_effect(move || {{");
-    writeln!(out, "        let queries = queries.clone();");
-    writeln!(out, "        if let Some(conn) = conn_signal.read().as_ref() {{");
-    writeln!(out, "            conn.subscription_builder()");
-    writeln!(out, "                .on_applied(|_ctx| {{}})");
-    writeln!(out, "                .on_error(|_ctx, _err| {{}})");
-    writeln!(out, "                .subscribe(queries);");
+    writeln!(
+        out,
+        "        // transition (None->Some on connect, Some->None on disconnect, Some(a)->Some(b) on reconnect)."
+    );
+    writeln!(out, "        let current = conn_signal();");
+    writeln!(out, "        let mut last = last_conn;");
+    writeln!(out);
+    writeln!(out, "        match current.as_ref() {{");
+    writeln!(out, "            None => {{");
+    writeln!(
+        out,
+        "                // Connection lost: clear the tracker so the next connection"
+    );
+    writeln!(out, "                // instance will trigger a fresh subscribe.");
+    writeln!(
+        out,
+        "                // peek() avoids creating a reactive dependency that would loop."
+    );
+    writeln!(out, "                if last.peek().is_some() {{");
+    writeln!(out, "                    last.set(None);");
+    writeln!(out, "                }}");
+    writeln!(out, "            }}");
+    writeln!(out, "            Some(conn) => {{");
+    writeln!(
+        out,
+        "                // peek() reads last without subscribing to it reactively."
+    );
+    writeln!(
+        out,
+        "                if last.peek().as_ref().map(|prev| Arc::ptr_eq(prev, conn)).unwrap_or(false) {{"
+    );
+    writeln!(
+        out,
+        "                    // Same connection instance – already subscribed, nothing to do."
+    );
+    writeln!(out, "                    return;");
+    writeln!(out, "                }}");
+    writeln!(
+        out,
+        "                // New or reconnected instance – store it and subscribe."
+    );
+    writeln!(out, "                last.set(Some(conn.clone()));");
+    writeln!(out, "                let queries = queries.clone();");
+    writeln!(out, "                conn.subscription_builder()");
+    writeln!(out, "                    .on_applied(|_ctx| {{}})");
+    writeln!(out, "                    .on_error(|_ctx, err| {{");
+    writeln!(
+        out,
+        "                        eprintln!(\"[spacetimedb] subscription error: {{err}}\");"
+    );
+    writeln!(out, "                    }})");
+    writeln!(out, "                    .subscribe(queries);");
+    writeln!(out, "            }}");
     writeln!(out, "        }}");
     writeln!(out, "    }});");
     writeln!(out, "}}");
@@ -853,32 +1134,36 @@ fn write_reducer_hook(out: &mut Indenter, reducer: &ReducerInfo) {
         // No-argument reducer
         writeln!(
             out,
-            "pub fn use_reducer_{}() -> impl Fn() + Clone + 'static {{",
+            "pub fn use_reducer_{}() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {{",
             reducer.name_snake,
         );
         writeln!(out, "    let conn_signal = use_connection();");
         writeln!(out);
         writeln!(out, "    move || {{");
-        writeln!(out, "        if let Some(conn) = conn_signal.read().as_ref() {{",);
-        writeln!(out, "            let _ = conn.reducers.{}();", reducer.name_snake);
+        writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{",);
+        writeln!(out, "            conn.reducers.{}()", reducer.name_snake);
+        writeln!(out, "        }} else {{");
+        writeln!(out, "            Err(spacetimedb_sdk::Error::Disconnected)");
         writeln!(out, "        }}");
         writeln!(out, "    }}");
     } else {
         // Reducer with arguments
         writeln!(
             out,
-            "pub fn use_reducer_{}() -> impl Fn({}) + Clone + 'static {{",
+            "pub fn use_reducer_{}() -> impl Fn({}) -> spacetimedb_sdk::Result<()> + Clone + 'static {{",
             reducer.name_snake, reducer.fn_trait_params,
         );
         writeln!(out, "    let conn_signal = use_connection();");
         writeln!(out);
         writeln!(out, "    move |{}| {{", reducer.closure_params);
-        writeln!(out, "        if let Some(conn) = conn_signal.read().as_ref() {{",);
+        writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{",);
         writeln!(
             out,
-            "            let _ = conn.reducers.{}({});",
+            "            conn.reducers.{}({})",
             reducer.name_snake, reducer.arg_names,
         );
+        writeln!(out, "        }} else {{");
+        writeln!(out, "            Err(spacetimedb_sdk::Error::Disconnected)");
         writeln!(out, "        }}");
         writeln!(out, "    }}");
     }
