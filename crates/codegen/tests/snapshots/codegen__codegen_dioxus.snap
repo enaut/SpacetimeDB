@@ -556,10 +556,53 @@ fn reconnect_delay_ms(attempt: u32) -> u64 {
     base_ms.saturating_add(jitter)
 }
 
-fn reconnect_sleep(delay_ms: u64) {
+#[cfg(not(target_arch = "wasm32"))]
+struct ThreadSleep {
+    done: Arc<std::sync::atomic::AtomicBool>,
+    started: bool,
+    delay_ms: u64,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ThreadSleep {
+    fn new(delay_ms: u64) -> Self {
+        Self {
+            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            started: false,
+            delay_ms,
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl std::future::Future for ThreadSleep {
+    type Output = ();
+
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        if self.done.load(std::sync::atomic::Ordering::Acquire) {
+            return std::task::Poll::Ready(());
+        }
+
+        if !self.started {
+            self.started = true;
+            let done = Arc::clone(&self.done);
+            let delay_ms = self.delay_ms;
+            let waker = cx.waker().clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                done.store(true, std::sync::atomic::Ordering::Release);
+                waker.wake();
+            });
+        }
+
+        std::task::Poll::Pending
+    }
+}
+
+async fn reconnect_sleep(delay_ms: u64) {
     #[cfg(not(target_arch = "wasm32"))]
     {
-        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        ThreadSleep::new(delay_ms).await;
     }
     #[cfg(target_arch = "wasm32")]
     {
@@ -785,7 +828,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                         }
                         let delay_ms = reconnect_delay_ms(reconnect_attempt);
                         state.set(ConnectionState::Reconnecting { attempt: reconnect_attempt, delay_ms });
-                        reconnect_sleep(delay_ms);
+                        reconnect_sleep(delay_ms).await;
                         continue;
                     }
                 };
@@ -823,7 +866,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
 
                 let delay_ms = reconnect_delay_ms(reconnect_attempt);
                 state.set(ConnectionState::Reconnecting { attempt: reconnect_attempt, delay_ms });
-                reconnect_sleep(delay_ms);
+                reconnect_sleep(delay_ms).await;
             }
         });
     });

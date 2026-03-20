@@ -674,13 +674,68 @@ fn write_reconnect_helpers(out: &mut Indenter) {
     writeln!(out, "    base_ms.saturating_add(jitter)");
     writeln!(out, "}}");
     writeln!(out);
-    writeln!(out, "fn reconnect_sleep(delay_ms: u64) {{");
-    writeln!(out, "    #[cfg(not(target_arch = \"wasm32\"))]");
-    writeln!(out, "    {{");
+    writeln!(out, "#[cfg(not(target_arch = \"wasm32\"))]");
+    writeln!(out, "struct ThreadSleep {{");
+    writeln!(out, "    done: Arc<std::sync::atomic::AtomicBool>,");
+    writeln!(out, "    started: bool,");
+    writeln!(out, "    delay_ms: u64,");
+    writeln!(out, "}}");
+    writeln!(out);
+    writeln!(out, "#[cfg(not(target_arch = \"wasm32\"))]");
+    writeln!(out, "impl ThreadSleep {{");
+    writeln!(out, "    fn new(delay_ms: u64) -> Self {{");
+    writeln!(out, "        Self {{");
     writeln!(
         out,
-        "        std::thread::sleep(std::time::Duration::from_millis(delay_ms));"
+        "            done: Arc::new(std::sync::atomic::AtomicBool::new(false)),"
     );
+    writeln!(out, "            started: false,");
+    writeln!(out, "            delay_ms,");
+    writeln!(out, "        }}");
+    writeln!(out, "    }}");
+    writeln!(out, "}}");
+    writeln!(out);
+    writeln!(out, "#[cfg(not(target_arch = \"wasm32\"))]");
+    writeln!(out, "impl std::future::Future for ThreadSleep {{");
+    writeln!(out, "    type Output = ();");
+    writeln!(out);
+    writeln!(
+        out,
+        "    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {{"
+    );
+    writeln!(
+        out,
+        "        if self.done.load(std::sync::atomic::Ordering::Acquire) {{"
+    );
+    writeln!(out, "            return std::task::Poll::Ready(());");
+    writeln!(out, "        }}");
+    writeln!(out);
+    writeln!(out, "        if !self.started {{");
+    writeln!(out, "            self.started = true;");
+    writeln!(out, "            let done = Arc::clone(&self.done);");
+    writeln!(out, "            let delay_ms = self.delay_ms;");
+    writeln!(out, "            let waker = cx.waker().clone();");
+    writeln!(out, "            std::thread::spawn(move || {{");
+    writeln!(
+        out,
+        "                std::thread::sleep(std::time::Duration::from_millis(delay_ms));"
+    );
+    writeln!(
+        out,
+        "                done.store(true, std::sync::atomic::Ordering::Release);"
+    );
+    writeln!(out, "                waker.wake();");
+    writeln!(out, "            }});");
+    writeln!(out, "        }}");
+    writeln!(out);
+    writeln!(out, "        std::task::Poll::Pending");
+    writeln!(out, "    }}");
+    writeln!(out, "}}");
+    writeln!(out);
+    writeln!(out, "async fn reconnect_sleep(delay_ms: u64) {{");
+    writeln!(out, "    #[cfg(not(target_arch = \"wasm32\"))]");
+    writeln!(out, "    {{");
+    writeln!(out, "        ThreadSleep::new(delay_ms).await;");
     writeln!(out, "    }}");
     writeln!(out, "    #[cfg(target_arch = \"wasm32\")]");
     writeln!(out, "    {{");
@@ -972,7 +1027,7 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
         out,
         "                        state.set(ConnectionState::Reconnecting {{ attempt: reconnect_attempt, delay_ms }});"
     );
-    writeln!(out, "                        reconnect_sleep(delay_ms);");
+    writeln!(out, "                        reconnect_sleep(delay_ms).await;");
     writeln!(out, "                        continue;");
     writeln!(out, "                    }}");
     writeln!(out, "                }};");
@@ -1025,7 +1080,7 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
         out,
         "                state.set(ConnectionState::Reconnecting {{ attempt: reconnect_attempt, delay_ms }});"
     );
-    writeln!(out, "                reconnect_sleep(delay_ms);");
+    writeln!(out, "                reconnect_sleep(delay_ms).await;");
     writeln!(out, "            }}");
     writeln!(out, "        }});");
     writeln!(out, "    }});");
