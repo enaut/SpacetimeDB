@@ -183,7 +183,6 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
         }),
         transform: Some(rolldown::BundlerTransformOptions {
             jsx: None,                                       // Don't transform JSX
-            jsx_preset: None,                                // No JSX preset because JSX transform is disabled
             target: Some(Either::Left("esnext".to_owned())), // Default, no transformation
             assumptions: None, // No compiler assumptions, we don't need to minmax output size
             decorator: None,   // Disable experimental decorators
@@ -219,6 +218,7 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
         clean_dir: None,
         context: None, // We don't want a top level `this` in modules
         tsconfig: Some(rolldown::TsConfig::Manual(cwd.join("tsconfig.json"))),
+        strict: None,
         strict_execution_order: None,
     })?;
 
