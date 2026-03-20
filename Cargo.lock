@@ -5242,9 +5242,7 @@ dependencies = [
 [[package]]
 name = "pg_interval"
 version = "0.4.4"
-version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ceff720b1579b383347d48e5df5f604042adaa6a06f640b1f1e3c065f40766d"
 checksum = "7ceff720b1579b383347d48e5df5f604042adaa6a06f640b1f1e3c065f40766d"
 dependencies = [
  "bytes",
@@ -5272,6 +5270,7 @@ dependencies = [
  "ryu",
  "serde",
  "serde_json",
+ "smol_str",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
@@ -5649,7 +5648,7 @@ dependencies = [
  "memchr",
  "parking_lot 0.12.5",
  "protobuf",
- "thiserror 2.0.17",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -7561,11 +7560,11 @@ dependencies = [
  "rand 0.8.5",
  "scoped-tls",
  "serde_json",
- "spacetimedb-bindings-macro 2.0.3",
- "spacetimedb-bindings-sys 2.0.3",
- "spacetimedb-lib 2.0.3",
- "spacetimedb-primitives 2.0.3",
- "spacetimedb-query-builder 2.0.3",
+ "spacetimedb-bindings-macro 2.0.5",
+ "spacetimedb-bindings-sys 2.0.5",
+ "spacetimedb-lib 2.0.5",
+ "spacetimedb-primitives 2.0.5",
+ "spacetimedb-query-builder 2.0.5",
  "trybuild",
 ]
 
@@ -7655,7 +7654,7 @@ dependencies = [
  "humantime",
  "proc-macro2",
  "quote",
- "spacetimedb-primitives 2.0.3",
+ "spacetimedb-primitives 2.0.5",
  "syn 2.0.117",
 ]
 
@@ -8343,9 +8342,9 @@ dependencies = [
 
 [[package]]
 name = "spacetimedb-query-builder"
-version = "2.0.3"
+version = "2.0.5"
 dependencies = [
- "spacetimedb-lib 2.0.3",
+ "spacetimedb-lib 2.0.5",
 ]
 
 [[package]]
@@ -8488,8 +8487,8 @@ dependencies = [
  "spacetimedb-data-structures",
  "spacetimedb-lib 2.0.5",
  "spacetimedb-metrics",
- "spacetimedb-query-builder 2.0.3",
- "spacetimedb-sats 2.0.3",
+ "spacetimedb-query-builder 2.0.5",
+ "spacetimedb-sats 2.0.5",
  "spacetimedb-schema",
  "spacetimedb-testing",
  "thiserror 1.0.69",
@@ -8682,10 +8681,12 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap 4.5.60",
+ "colored",
  "dialoguer",
  "flate2",
  "http-body-util",
  "indicatif",
+ "log",
  "reqwest 0.12.28",
  "self-replace",
  "semver",
@@ -9100,9 +9101,7 @@ checksum = "adb6935a6f5c20170eeceb1a3835a49e12e19d792f6dd344ccc76a985ca5a6ca"
 [[package]]
 name = "target-triple"
 version = "1.0.0"
-version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 checksum = "591ef38edfb78ca4771ee32cf494cb8771944bee237a9b91fc9c1424ac4b777b"
 
 [[package]]
@@ -11380,6 +11379,7 @@ dependencies = [
  "blake3",
  "chrono",
  "clap 4.5.60",
+ "dotenvy",
  "fs2",
  "futures",
  "heck 0.5.0",
