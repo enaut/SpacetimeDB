@@ -196,7 +196,11 @@ fn generate_reducer_file_with_aliases(module: &ModuleDef, reducer: &ReducerDef) 
         "    /// Use [`{func_name}::{func_name}_then`] to run a callback after the reducer completes."
     );
     writeln!(out, "    fn {func_name}(&self, {arglist}) -> __sdk::Result<()> {{");
-    writeln!(out, "        self.{func_name}_then({arg_names}, |_, _| {{}})");
+    if arg_names.is_empty() {
+        writeln!(out, "        self.{func_name}_then(|_, _| {{}})");
+    } else {
+        writeln!(out, "        self.{func_name}_then({arg_names}, |_, _| {{}})");
+    }
     writeln!(out, "    }}");
     writeln!(out);
     writeln!(
@@ -216,7 +220,9 @@ fn generate_reducer_file_with_aliases(module: &ModuleDef, reducer: &ReducerDef) 
     writeln!(out, "    ///  and its status can be observed with the `callback`.");
     writeln!(out, "    fn {func_name}_then(");
     writeln!(out, "        &self,");
-    writeln!(out, "        {arglist},");
+    if !arglist.is_empty() {
+        writeln!(out, "        {arglist},");
+    }
     writeln!(
         out,
         "        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)"
@@ -230,7 +236,9 @@ fn generate_reducer_file_with_aliases(module: &ModuleDef, reducer: &ReducerDef) 
     writeln!(out, "impl {func_name} for super::RemoteReducers {{");
     writeln!(out, "    fn {func_name}_then(");
     writeln!(out, "        &self,");
-    writeln!(out, "        {arglist},");
+    if !arglist.is_empty() {
+        writeln!(out, "        {arglist},");
+    }
     writeln!(
         out,
         "        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)"
@@ -999,7 +1007,7 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
         "                        state_on_disconnect.set(ConnectionState::Disconnected);"
     );
     writeln!(out, "                    }})");
-    writeln!(out, "                    .build() {{");
+    writeln!(out, "                    .build().await {{");
     writeln!(out, "                    Ok(conn) => conn,");
     writeln!(out, "                    Err(e) => {{");
     writeln!(out, "                        connection.set(None);");
