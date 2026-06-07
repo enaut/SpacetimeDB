@@ -7,13 +7,14 @@
 //!   and creates `SyncSignal`s for all tables.
 //! - `use_table_*` — Per-table hooks returning `SyncSignal<Vec<Row>>`.
 //! - `use_reducer_*` — Per-reducer hooks returning callable closures.
+//! - `use_procedure_*` — Per-procedure hooks returning `(invoke, SyncSignal<Option<Result<T, String>>>)`.
 //! - `use_subscription` — Hook for subscribing to SQL queries.
 //! - Connection state hooks for monitoring connection status.
 
 use super::code_indenter::{CodeIndenter, Indenter};
 use crate::rust::type_name;
 use crate::util::{
-    collect_case, is_reducer_invokable, iter_reducers, iter_table_names_and_types, iter_tables,
+    collect_case, is_reducer_invokable, iter_procedures, iter_reducers, iter_table_names_and_types, iter_tables,
     print_auto_generated_file_comment, print_auto_generated_version_comment, type_ref_name, CodegenVisibility,
 };
 use crate::{CodegenOptions, Lang, OutputFile};
@@ -399,6 +400,24 @@ fn collect_tables(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<Tabl
         .collect()
 }
 
+/// Collect procedure metadata for code generation.
+struct ProcedureInfo {
+    /// snake_case accessor name (e.g. "provision_message_category")
+    name_snake: String,
+    /// Original procedure name as declared in the module
+    name_orig: String,
+    /// Parameter list formatted as "name: Type, name: Type"
+    arglist: String,
+    /// Parameter names formatted as "name, name"
+    arg_names: String,
+    /// Closure parameter list formatted as "name: Type, name: Type"
+    closure_params: String,
+    /// Fn trait parameter list (types only) formatted as "Type, Type"
+    fn_trait_params: String,
+    /// Return type as a Rust type expression string
+    return_type: String,
+}
+
 /// Collect reducer metadata for code generation.
 struct ReducerInfo {
     /// snake_case name (e.g. "add_todo")
@@ -435,6 +454,58 @@ fn type_name_for_hook(module: &ModuleDef, ty: &AlgebraicTypeUse, reducer_wrapper
             type_name(module, ty)
         }
     }
+}
+
+fn collect_procedures(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<ProcedureInfo> {
+    iter_procedures(module, visibility)
+        .map(|proc| {
+            let name_snake = proc.accessor_name.deref().to_case(Case::Snake);
+            let name_orig = proc.name.deref().to_string();
+
+            // The wrapper struct name used in the generated procedure file.
+            // We pass it to type_name_for_hook to handle any potential name conflicts.
+            let wrapper_struct_name = proc.accessor_name.deref().to_case(Case::Pascal) + "Args";
+
+            let mut arglist = String::new();
+            let mut arg_names = String::new();
+            let mut closure_params = String::new();
+            let mut fn_trait_params = String::new();
+
+            for (i, (arg_ident, arg_ty)) in proc.params_for_generate.elements.iter().enumerate() {
+                let arg_name = arg_ident.deref().to_case(Case::Snake);
+                let arg_type = type_name_for_hook(module, arg_ty, &wrapper_struct_name);
+
+                if i > 0 {
+                    arglist.push_str(", ");
+                    arg_names.push_str(", ");
+                    closure_params.push_str(", ");
+                    fn_trait_params.push_str(", ");
+                }
+                arglist.push_str(&format!("{arg_name}: {arg_type}"));
+                arg_names.push_str(&arg_name);
+                closure_params.push_str(&format!("{arg_name}: {arg_type}"));
+                fn_trait_params.push_str(&arg_type.to_string());
+            }
+
+            let mut return_type = String::new();
+            write_type_to_string(
+                &mut return_type,
+                module,
+                &proc.return_type_for_generate,
+                &HashMap::new(),
+            );
+
+            ProcedureInfo {
+                name_snake,
+                name_orig,
+                arglist,
+                arg_names,
+                closure_params,
+                fn_trait_params,
+                return_type,
+            }
+        })
+        .collect()
 }
 
 fn collect_reducers(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<ReducerInfo> {
@@ -484,6 +555,7 @@ fn collect_reducers(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<Re
 fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> OutputFile {
     let tables = collect_tables(module, visibility);
     let reducers = collect_reducers(module, visibility);
+    let procedures = collect_procedures(module, visibility);
 
     let mut output = CodeIndenter::new(String::new(), INDENT);
     let out = &mut output;
@@ -624,6 +696,16 @@ fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> O
     for reducer in &reducers {
         write_reducer_hook(out, reducer);
         writeln!(out);
+    }
+
+    // Procedure hooks
+    if !procedures.is_empty() {
+        writeln!(out, "// --- Procedure hooks ---");
+        writeln!(out);
+        for proc in &procedures {
+            write_procedure_hook(out, proc);
+            writeln!(out);
+        }
     }
 
     // Connection state hooks
@@ -1186,6 +1268,64 @@ fn write_subscription_hook(out: &mut Indenter) {
     writeln!(out, "            }}");
     writeln!(out, "        }}");
     writeln!(out, "    }});");
+    writeln!(out, "}}");
+}
+
+fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
+    let name_orig = &proc.name_orig;
+    let name_snake = &proc.name_snake;
+    let ret = &proc.return_type;
+    let fn_trait_params = &proc.fn_trait_params;
+
+    writeln!(
+        out,
+        "/// Invoke the `{name_orig}` procedure and get a reactive signal for its result.",
+    );
+    writeln!(out, "///");
+    writeln!(
+        out,
+        "/// Returns `(invoke, result)`. Calling `invoke(...)` sends the procedure call to the server.",
+    );
+    writeln!(
+        out,
+        "/// The `result` signal is updated to `Some(Ok(value))` on success or `Some(Err(message))`",
+    );
+    writeln!(out, "/// on failure once the server responds.");
+    writeln!(out, "#[must_use]");
+
+    let fn_type = if fn_trait_params.is_empty() {
+        format!("impl Fn() + Clone + 'static")
+    } else {
+        format!("impl Fn({fn_trait_params}) + Clone + 'static")
+    };
+    writeln!(
+        out,
+        "pub fn use_procedure_{name_snake}() -> ({fn_type}, SyncSignal<Option<Result<{ret}, String>>>) {{",
+    );
+    writeln!(out, "    let conn_signal = use_connection();");
+    writeln!(
+        out,
+        "    let result: SyncSignal<Option<Result<{ret}, String>>> = use_signal_sync(|| None);",
+    );
+    writeln!(out);
+    writeln!(out, "    let invoke = move |{}| {{", proc.closure_params);
+    writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{");
+    writeln!(out, "            let mut result = result;");
+    if proc.arg_names.is_empty() {
+        writeln!(out, "            conn.procedures.{name_snake}_then(move |_ctx, res| {{",);
+    } else {
+        writeln!(
+            out,
+            "            conn.procedures.{name_snake}_then({}, move |_ctx, res| {{",
+            proc.arg_names,
+        );
+    }
+    writeln!(out, "                result.set(Some(res.map_err(|e| e.to_string())));");
+    writeln!(out, "            }});");
+    writeln!(out, "        }}");
+    writeln!(out, "    }};");
+    writeln!(out);
+    writeln!(out, "    (invoke, result)");
     writeln!(out, "}}");
 }
 
