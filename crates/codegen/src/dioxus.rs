@@ -15,7 +15,8 @@ use super::code_indenter::{CodeIndenter, Indenter};
 use crate::rust::type_name;
 use crate::util::{
     collect_case, is_reducer_invokable, iter_procedures, iter_reducers, iter_table_names_and_types, iter_tables,
-    print_auto_generated_file_comment, print_auto_generated_version_comment, type_ref_name, CodegenVisibility,
+    iter_views, print_auto_generated_file_comment, print_auto_generated_version_comment, type_ref_name,
+    CodegenVisibility,
 };
 use crate::{CodegenOptions, Lang, OutputFile};
 use convert_case::{Case, Casing};
@@ -376,21 +377,31 @@ struct TableInfo {
     accessor_snake: String,
     /// PascalCase row type name (e.g. "Todo")
     row_type: String,
-    /// Whether the table has a primary key (enables on_update callback)
+    /// Whether the table/view has a primary key (enables on_update callback)
     has_primary_key: bool,
 }
 
 fn collect_tables(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<TableInfo> {
+    // Real tables with a primary key column.
     let tables_with_pk: std::collections::HashSet<String> = iter_tables(module, visibility)
         .filter(|t| t.primary_key.is_some())
         .map(|t| t.accessor_name.deref().to_string())
+        .collect();
+    // Views also carry their own `primary_key`, set by the schema validator when a
+    // query-builder view's underlying table has a primary key. Client-side table
+    // handles for such views implement `TableWithPrimaryKey`/`on_update` just like
+    // real tables do, so they must be considered here too.
+    let views_with_pk: std::collections::HashSet<String> = iter_views(module)
+        .filter(|v| v.primary_key.is_some())
+        .map(|v| v.accessor_name.deref().to_string())
         .collect();
 
     iter_table_names_and_types(module, visibility)
         .map(|(_, accessor_name, product_type_ref)| {
             let accessor_snake = accessor_name.deref().to_case(Case::Snake);
             let row_type = type_ref_name(module, product_type_ref);
-            let has_primary_key = tables_with_pk.contains(accessor_name.deref());
+            let has_primary_key =
+                tables_with_pk.contains(accessor_name.deref()) || views_with_pk.contains(accessor_name.deref());
             TableInfo {
                 accessor_snake,
                 row_type,

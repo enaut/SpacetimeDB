@@ -5,8 +5,8 @@ use spacetimedb::http::{Body, HandlerContext, Request, Response, Router};
 use spacetimedb::spacetimedb_lib::db::raw_def::v9::TableAccess;
 use spacetimedb::spacetimedb_lib::{self, bsatn};
 use spacetimedb::{
-    duration, table, CaseConversionPolicy, ConnectionId, Deserialize, Identity, ReducerContext, SpacetimeType, Table,
-    TimeDuration, Timestamp, ViewContext,
+    duration, table, CaseConversionPolicy, ConnectionId, Deserialize, Identity, Query, ReducerContext, SpacetimeType,
+    Table, TimeDuration, Timestamp, ViewContext,
 };
 use spacetimedb::{log, ProcedureContext};
 
@@ -88,6 +88,17 @@ pub struct TestE {
     id: u64,
     #[index(btree)]
     name: String,
+}
+
+/// A query-builder view over a table with a primary key.
+///
+/// Regression test: client codegen must propagate `TestE`'s primary key to this
+/// view so that generated table handles (and, for the Dioxus backend, the
+/// `on_update` signal registration) treat rows from this view as updatable in
+/// place rather than only insertable/deletable.
+#[spacetimedb::view(accessor = test_e_view, public)]
+pub fn test_e_view(ctx: &ViewContext) -> impl Query<TestE> {
+    ctx.from.test_e().build()
 }
 
 #[derive(SpacetimeType)]
