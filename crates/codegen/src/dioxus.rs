@@ -1332,11 +1332,17 @@ fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
     writeln!(out, "            }});");
     writeln!(out, "            spawn(async move {{");
     writeln!(out, "                if let Ok(res) = rx.await {{");
-    writeln!(out, "                    result.set(Some(res.map_err(|e| e.to_string())));");
+    writeln!(
+        out,
+        "                    result.set(Some(res.map_err(|e| e.to_string())));"
+    );
     writeln!(out, "                }}");
     writeln!(out, "            }});");
     writeln!(out, "        }} else {{");
-    writeln!(out, "            result.set(Some(Err(\"Disconnected from SpacetimeDB\".to_string())));");
+    writeln!(
+        out,
+        "            result.set(Some(Err(\"Disconnected from SpacetimeDB\".to_string())));"
+    );
     writeln!(out, "        }}");
     writeln!(out, "    }};");
     writeln!(out);
@@ -1345,32 +1351,30 @@ fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
     writeln!(out);
 
     // use_procedure_{name}_async
-    writeln!(
-        out,
-        "/// Invoke the `{name_orig}` procedure asynchronously.",
-    );
+    writeln!(out, "/// Invoke the `{name_orig}` procedure asynchronously.",);
     writeln!(out, "///");
     writeln!(
         out,
         "/// Returns a closure that can be called to invoke the procedure and `await` the response directly.",
     );
     writeln!(out, "#[must_use]");
+    let boxed_future = format!("std::pin::Pin<Box<dyn std::future::Future<Output = Result<{ret}, String>>>>");
     let async_fn_type = if fn_trait_params.is_empty() {
-        format!("impl Fn() -> impl std::future::Future<Output = Result<{ret}, String>> + Clone + 'static")
+        format!("impl Fn() -> {boxed_future} + Clone + 'static")
     } else {
-        format!("impl Fn({fn_trait_params}) -> impl std::future::Future<Output = Result<{ret}, String>> + Clone + 'static")
+        format!("impl Fn({fn_trait_params}) -> {boxed_future} + Clone + 'static")
     };
-    writeln!(
-        out,
-        "pub fn use_procedure_{name_snake}_async() -> {async_fn_type} {{",
-    );
+    writeln!(out, "pub fn use_procedure_{name_snake}_async() -> {async_fn_type} {{",);
     writeln!(out, "    let conn_signal = use_connection();");
     writeln!(out);
-    writeln!(out, "    move |{}| {{", proc.closure_params);
+    writeln!(out, "    move |{}| -> {boxed_future} {{", proc.closure_params);
     writeln!(out, "        let conn = conn_signal();");
-    writeln!(out, "        async move {{");
+    writeln!(out, "        Box::pin(async move {{");
     writeln!(out, "            let Some(conn) = conn.as_ref() else {{");
-    writeln!(out, "                return Err(\"Disconnected from SpacetimeDB\".to_string());");
+    writeln!(
+        out,
+        "                return Err(\"Disconnected from SpacetimeDB\".to_string());"
+    );
     writeln!(out, "            }};");
     writeln!(out, "            let (tx, rx) = oneshot::channel();");
     if proc.arg_names.is_empty() {
@@ -1388,7 +1392,7 @@ fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
     writeln!(out, "                Ok(res) => res.map_err(|e| e.to_string()),");
     writeln!(out, "                Err(_) => Err(\"Request cancelled\".to_string()),");
     writeln!(out, "            }}");
-    writeln!(out, "        }}");
+    writeln!(out, "        }})");
     writeln!(out, "    }}");
     writeln!(out, "}}");
 }
@@ -1429,10 +1433,7 @@ fn write_reducer_hook(out: &mut Indenter, reducer: &ReducerInfo) {
         writeln!(out);
         writeln!(out, "    move |{closure_params}| {{");
         writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{",);
-        writeln!(
-            out,
-            "            conn.reducers.{name_snake}({arg_names})",
-        );
+        writeln!(out, "            conn.reducers.{name_snake}({arg_names})",);
         writeln!(out, "        }} else {{");
         writeln!(out, "            Err(spacetimedb_sdk::Error::Disconnected)");
         writeln!(out, "        }}");
@@ -1528,20 +1529,18 @@ fn write_reducer_hook(out: &mut Indenter, reducer: &ReducerInfo) {
         "/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.",
     );
     writeln!(out, "#[must_use]");
+    let boxed_future = "std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>>";
     let async_fn_type = if fn_trait_params.is_empty() {
-        "impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static".to_string()
+        format!("impl Fn() -> {boxed_future} + Clone + 'static")
     } else {
-        format!("impl Fn({fn_trait_params}) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static")
+        format!("impl Fn({fn_trait_params}) -> {boxed_future} + Clone + 'static")
     };
-    writeln!(
-        out,
-        "pub fn use_reducer_{name_snake}_async() -> {async_fn_type} {{",
-    );
+    writeln!(out, "pub fn use_reducer_{name_snake}_async() -> {async_fn_type} {{",);
     writeln!(out, "    let conn_signal = use_connection();");
     writeln!(out);
-    writeln!(out, "    move |{closure_params}| {{");
+    writeln!(out, "    move |{closure_params}| -> {boxed_future} {{");
     writeln!(out, "        let conn = conn_signal();");
-    writeln!(out, "        async move {{");
+    writeln!(out, "        Box::pin(async move {{");
     writeln!(out, "            let Some(conn) = conn.as_ref() else {{");
     writeln!(
         out,
@@ -1570,7 +1569,7 @@ fn write_reducer_hook(out: &mut Indenter, reducer: &ReducerInfo) {
     writeln!(out, "                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),");
     writeln!(out, "                Err(_) => Err(\"Request cancelled\".to_string()),");
     writeln!(out, "            }}");
-    writeln!(out, "        }}");
+    writeln!(out, "        }})");
     writeln!(out, "    }}");
     writeln!(out, "}}");
 }
