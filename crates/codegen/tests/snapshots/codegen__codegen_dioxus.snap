@@ -274,7 +274,7 @@ pub trait assert_caller_identity_is_module_identity {
     ///
     /// Use [`assert_caller_identity_is_module_identity::assert_caller_identity_is_module_identity_then`] to run a callback after the reducer completes.
     fn assert_caller_identity_is_module_identity(&self, ) -> __sdk::Result<()> {
-        self.assert_caller_identity_is_module_identity_then(, |_, _| {})
+        self.assert_caller_identity_is_module_identity_then(|_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `assert_caller_identity_is_module_identity` to run as soon as possible,
@@ -285,7 +285,6 @@ pub trait assert_caller_identity_is_module_identity {
     ///  and its status can be observed with the `callback`.
     fn assert_caller_identity_is_module_identity_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -295,7 +294,6 @@ pub trait assert_caller_identity_is_module_identity {
 impl assert_caller_identity_is_module_identity for super::RemoteReducers {
     fn assert_caller_identity_is_module_identity_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -496,6 +494,7 @@ use ::dioxus::prelude::*;
 use ::dioxus::signals::SyncSignal;
 use spacetimedb_sdk::{DbContext, Table, TableWithPrimaryKey, Identity};
 use std::sync::{Arc, Mutex};
+use futures_channel::oneshot;
 
 /// Thread-safe wrapper for the database connection.
 pub type SharedConnection = Arc<DbConnection>;
@@ -508,6 +507,7 @@ pub struct TableSignals {
     pub person: SyncSignal<Vec<Person>>,
     pub player: SyncSignal<Vec<Player>>,
     pub test_d: SyncSignal<Vec<TestD>>,
+    pub test_e_view: SyncSignal<Vec<TestE>>,
     pub test_f: SyncSignal<Vec<TestFoobar>>,
 }
 
@@ -648,6 +648,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
         person: use_signal_sync(Vec::new),
         player: use_signal_sync(Vec::new),
         test_d: use_signal_sync(Vec::new),
+        test_e_view: use_signal_sync(Vec::new),
         test_f: use_signal_sync(Vec::new),
     };
 
@@ -778,6 +779,23 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                         let updated: Vec<TestD> = ctx.db.test_d().iter().collect();
                         table_signals_on_connect.test_d.set(updated);
                     });
+                    // Populate initial rows for test_e_view
+                    let current: Vec<TestE> = conn.db.test_e_view().iter().collect();
+                    table_signals_on_connect.test_e_view.set(current);
+
+                    // Keep signal in sync on changes
+                    conn.db.test_e_view().on_insert(move |ctx, _row| {
+                        let updated: Vec<TestE> = ctx.db.test_e_view().iter().collect();
+                        table_signals_on_connect.test_e_view.set(updated);
+                    });
+                    conn.db.test_e_view().on_update(move |ctx, _old, _new| {
+                        let updated: Vec<TestE> = ctx.db.test_e_view().iter().collect();
+                        table_signals_on_connect.test_e_view.set(updated);
+                    });
+                    conn.db.test_e_view().on_delete(move |ctx, _row| {
+                        let updated: Vec<TestE> = ctx.db.test_e_view().iter().collect();
+                        table_signals_on_connect.test_e_view.set(updated);
+                    });
                     // Populate initial rows for test_f
                     let current: Vec<TestFoobar> = conn.db.test_f().iter().collect();
                     table_signals_on_connect.test_f.set(current);
@@ -812,7 +830,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                         }
                         state_on_disconnect.set(ConnectionState::Disconnected);
                     })
-                    .build() {
+                    .build().await {
                     Ok(conn) => conn,
                     Err(e) => {
                         connection.set(None);
@@ -972,6 +990,13 @@ pub fn use_table_test_d() -> SyncSignal<Vec<TestD>> {
     ctx.tables.test_d
 }
 
+/// Get a reactive signal containing all rows of the `test_e_view` table.
+#[must_use]
+pub fn use_table_test_e_view() -> SyncSignal<Vec<TestE>> {
+    let ctx = use_spacetimedb_context();
+    ctx.tables.test_e_view
+}
+
 /// Get a reactive signal containing all rows of the `test_f` table.
 #[must_use]
 pub fn use_table_test_f() -> SyncSignal<Vec<TestFoobar>> {
@@ -995,6 +1020,74 @@ pub fn use_reducer_add() -> impl Fn(String, u8) -> spacetimedb_sdk::Result<()> +
     }
 }
 
+/// Invoke the `add` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_add_then() -> (impl Fn(String, u8) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |name: String, age: u8| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.add_then(name, age, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `add` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_add_async() -> impl Fn(String, u8) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |name: String, age: u8| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.add_then(name, age, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
 /// Get a callback to invoke the `add_player` reducer.
 #[must_use]
 pub fn use_reducer_add_player() -> impl Fn(String) -> spacetimedb_sdk::Result<()> + Clone + 'static {
@@ -1005,6 +1098,74 @@ pub fn use_reducer_add_player() -> impl Fn(String) -> spacetimedb_sdk::Result<()
             conn.reducers.add_player(name)
         } else {
             Err(spacetimedb_sdk::Error::Disconnected)
+        }
+    }
+}
+
+/// Invoke the `add_player` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_add_player_then() -> (impl Fn(String) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |name: String| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.add_player_then(name, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `add_player` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_add_player_async() -> impl Fn(String) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |name: String| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.add_player_then(name, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
         }
     }
 }
@@ -1023,6 +1184,74 @@ pub fn use_reducer_add_private() -> impl Fn(String) -> spacetimedb_sdk::Result<(
     }
 }
 
+/// Invoke the `add_private` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_add_private_then() -> (impl Fn(String) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |name: String| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.add_private_then(name, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `add_private` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_add_private_async() -> impl Fn(String) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |name: String| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.add_private_then(name, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
 /// Get a callback to invoke the `assert_caller_identity_is_module_identity` reducer.
 #[must_use]
 pub fn use_reducer_assert_caller_identity_is_module_identity() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {
@@ -1033,6 +1262,74 @@ pub fn use_reducer_assert_caller_identity_is_module_identity() -> impl Fn() -> s
             conn.reducers.assert_caller_identity_is_module_identity()
         } else {
             Err(spacetimedb_sdk::Error::Disconnected)
+        }
+    }
+}
+
+/// Invoke the `assert_caller_identity_is_module_identity` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_assert_caller_identity_is_module_identity_then() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.assert_caller_identity_is_module_identity_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `assert_caller_identity_is_module_identity` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_assert_caller_identity_is_module_identity_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.assert_caller_identity_is_module_identity_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
         }
     }
 }
@@ -1051,6 +1348,74 @@ pub fn use_reducer_delete_player() -> impl Fn(u64) -> spacetimedb_sdk::Result<()
     }
 }
 
+/// Invoke the `delete_player` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_delete_player_then() -> (impl Fn(u64) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |id: u64| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.delete_player_then(id, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `delete_player` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_delete_player_async() -> impl Fn(u64) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |id: u64| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.delete_player_then(id, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
 /// Get a callback to invoke the `delete_players_by_name` reducer.
 #[must_use]
 pub fn use_reducer_delete_players_by_name() -> impl Fn(String) -> spacetimedb_sdk::Result<()> + Clone + 'static {
@@ -1061,6 +1426,74 @@ pub fn use_reducer_delete_players_by_name() -> impl Fn(String) -> spacetimedb_sd
             conn.reducers.delete_players_by_name(name)
         } else {
             Err(spacetimedb_sdk::Error::Disconnected)
+        }
+    }
+}
+
+/// Invoke the `delete_players_by_name` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_delete_players_by_name_then() -> (impl Fn(String) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |name: String| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.delete_players_by_name_then(name, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `delete_players_by_name` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_delete_players_by_name_async() -> impl Fn(String) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |name: String| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.delete_players_by_name_then(name, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
         }
     }
 }
@@ -1079,6 +1512,74 @@ pub fn use_reducer_list_over_age() -> impl Fn(u8) -> spacetimedb_sdk::Result<()>
     }
 }
 
+/// Invoke the `list_over_age` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_list_over_age_then() -> (impl Fn(u8) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |age: u8| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.list_over_age_then(age, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `list_over_age` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_list_over_age_async() -> impl Fn(u8) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |age: u8| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.list_over_age_then(age, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
 /// Get a callback to invoke the `log_module_identity` reducer.
 #[must_use]
 pub fn use_reducer_log_module_identity() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {
@@ -1089,6 +1590,74 @@ pub fn use_reducer_log_module_identity() -> impl Fn() -> spacetimedb_sdk::Result
             conn.reducers.log_module_identity()
         } else {
             Err(spacetimedb_sdk::Error::Disconnected)
+        }
+    }
+}
+
+/// Invoke the `log_module_identity` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_log_module_identity_then() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.log_module_identity_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `log_module_identity` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_log_module_identity_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.log_module_identity_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
         }
     }
 }
@@ -1107,6 +1676,74 @@ pub fn use_reducer_query_private() -> impl Fn() -> spacetimedb_sdk::Result<()> +
     }
 }
 
+/// Invoke the `query_private` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_query_private_then() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.query_private_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `query_private` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_query_private_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.query_private_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
 /// Get a callback to invoke the `say_hello` reducer.
 #[must_use]
 pub fn use_reducer_say_hello() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {
@@ -1117,6 +1754,74 @@ pub fn use_reducer_say_hello() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clo
             conn.reducers.say_hello()
         } else {
             Err(spacetimedb_sdk::Error::Disconnected)
+        }
+    }
+}
+
+/// Invoke the `say_hello` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_say_hello_then() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.say_hello_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `say_hello` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_say_hello_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.say_hello_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
         }
     }
 }
@@ -1135,6 +1840,74 @@ pub fn use_reducer_test() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTest
     }
 }
 
+/// Invoke the `test` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_test_then() -> (impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |arg: TestA, arg_2: TestB, arg_3: NamespaceTestC, arg_4: NamespaceTestF| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.test_then(arg, arg_2, arg_3, arg_4, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `test` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_test_async() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |arg: TestA, arg_2: TestB, arg_3: NamespaceTestC, arg_4: NamespaceTestF| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.test_then(arg, arg_2, arg_3, arg_4, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
 /// Get a callback to invoke the `test_btree_index_args` reducer.
 #[must_use]
 pub fn use_reducer_test_btree_index_args() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {
@@ -1145,6 +1918,300 @@ pub fn use_reducer_test_btree_index_args() -> impl Fn() -> spacetimedb_sdk::Resu
             conn.reducers.test_btree_index_args()
         } else {
             Err(spacetimedb_sdk::Error::Disconnected)
+        }
+    }
+}
+
+/// Invoke the `test_btree_index_args` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_test_btree_index_args_then() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.test_btree_index_args_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `test_btree_index_args` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_test_btree_index_args_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.test_btree_index_args_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
+// --- Procedure hooks ---
+
+/// Invoke the `get_my_schema_via_http` procedure and get a reactive signal for its result.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the procedure call to the server.
+/// The `result` signal is updated to `Some(Ok(value))` on success or `Some(Err(message))`
+/// on failure once the server responds.
+#[must_use]
+pub fn use_procedure_get_my_schema_via_http() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<String, String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<String, String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.get_my_schema_via_http_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    result.set(Some(res.map_err(|e| e.to_string())));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `get_my_schema_via_http` procedure asynchronously.
+///
+/// Returns a closure that can be called to invoke the procedure and `await` the response directly.
+#[must_use]
+pub fn use_procedure_get_my_schema_via_http_async() -> impl Fn() -> impl std::future::Future<Output = Result<String, String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.get_my_schema_via_http_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            match rx.await {
+                Ok(res) => res.map_err(|e| e.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
+/// Invoke the `return_value` procedure and get a reactive signal for its result.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the procedure call to the server.
+/// The `result` signal is updated to `Some(Ok(value))` on success or `Some(Err(message))`
+/// on failure once the server responds.
+#[must_use]
+pub fn use_procedure_return_value() -> (impl Fn(u64) + Clone + 'static, SyncSignal<Option<Result<Baz, String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<Baz, String>>> = use_signal_sync(|| None);
+
+    let invoke = move |foo: u64| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.return_value_then(foo, move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    result.set(Some(res.map_err(|e| e.to_string())));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `return_value` procedure asynchronously.
+///
+/// Returns a closure that can be called to invoke the procedure and `await` the response directly.
+#[must_use]
+pub fn use_procedure_return_value_async() -> impl Fn(u64) -> impl std::future::Future<Output = Result<Baz, String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |foo: u64| {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.return_value_then(foo, move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            match rx.await {
+                Ok(res) => res.map_err(|e| e.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
+/// Invoke the `sleep_one_second` procedure and get a reactive signal for its result.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the procedure call to the server.
+/// The `result` signal is updated to `Some(Ok(value))` on success or `Some(Err(message))`
+/// on failure once the server responds.
+#[must_use]
+pub fn use_procedure_sleep_one_second() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.sleep_one_second_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    result.set(Some(res.map_err(|e| e.to_string())));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `sleep_one_second` procedure asynchronously.
+///
+/// Returns a closure that can be called to invoke the procedure and `await` the response directly.
+#[must_use]
+pub fn use_procedure_sleep_one_second_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.sleep_one_second_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            match rx.await {
+                Ok(res) => res.map_err(|e| e.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        }
+    }
+}
+
+/// Invoke the `with_tx` procedure and get a reactive signal for its result.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the procedure call to the server.
+/// The `result` signal is updated to `Some(Ok(value))` on success or `Some(Err(message))`
+/// on failure once the server responds.
+#[must_use]
+pub fn use_procedure_with_tx() -> (impl Fn() + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move || {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.with_tx_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    result.set(Some(res.map_err(|e| e.to_string())));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `with_tx` procedure asynchronously.
+///
+/// Returns a closure that can be called to invoke the procedure and `await` the response directly.
+#[must_use]
+pub fn use_procedure_with_tx_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move || {
+        let conn = conn_signal();
+        async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.with_tx_then(move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            match rx.await {
+                Ok(res) => res.map_err(|e| e.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
         }
     }
 }
@@ -1432,7 +2499,7 @@ pub trait log_module_identity {
     ///
     /// Use [`log_module_identity::log_module_identity_then`] to run a callback after the reducer completes.
     fn log_module_identity(&self, ) -> __sdk::Result<()> {
-        self.log_module_identity_then(, |_, _| {})
+        self.log_module_identity_then(|_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `log_module_identity` to run as soon as possible,
@@ -1443,7 +2510,6 @@ pub trait log_module_identity {
     ///  and its status can be observed with the `callback`.
     fn log_module_identity_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -1453,7 +2519,6 @@ pub trait log_module_identity {
 impl log_module_identity for super::RemoteReducers {
     fn log_module_identity_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -1488,6 +2553,18 @@ pub struct LoggedOutPlayerTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `logged_out_player`.
+pub struct LoggedOutPlayerTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for LoggedOutPlayerTableAccessor {
+    type Row = Player;
+    type Handle<'db> = LoggedOutPlayerTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.logged_out_player()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `logged_out_player`.
 ///
@@ -1509,6 +2586,14 @@ impl LoggedOutPlayerTableAccess for super::RemoteTables {
 
 pub struct LoggedOutPlayerInsertCallbackId(__sdk::CallbackId);
 pub struct LoggedOutPlayerDeleteCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableLike for LoggedOutPlayerTableHandle<'ctx> {
+    type Row = Player;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+}
 
 impl<'ctx> __sdk::Table for LoggedOutPlayerTableHandle<'ctx> {
     type Row = Player;
@@ -1544,9 +2629,54 @@ impl<'ctx> __sdk::Table for LoggedOutPlayerTableHandle<'ctx> {
     }
 }
 
+impl<'ctx> __sdk::WithInsert for LoggedOutPlayerTableHandle<'ctx> {
+    type InsertCallbackId = LoggedOutPlayerInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> LoggedOutPlayerInsertCallbackId {
+        LoggedOutPlayerInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: LoggedOutPlayerInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for LoggedOutPlayerTableHandle<'ctx> {
+    type DeleteCallbackId = LoggedOutPlayerDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> LoggedOutPlayerDeleteCallbackId {
+        LoggedOutPlayerDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: LoggedOutPlayerDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
 pub struct LoggedOutPlayerUpdateCallbackId(__sdk::CallbackId);
 
 impl<'ctx> __sdk::TableWithPrimaryKey for LoggedOutPlayerTableHandle<'ctx> {
+    type UpdateCallbackId = LoggedOutPlayerUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> LoggedOutPlayerUpdateCallbackId {
+        LoggedOutPlayerUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: LoggedOutPlayerUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithUpdate for LoggedOutPlayerTableHandle<'ctx> {
     type UpdateCallbackId = LoggedOutPlayerUpdateCallbackId;
 
     fn on_update(
@@ -1708,6 +2838,7 @@ pub mod dioxus;
 pub mod baz_type;
 pub mod foobar_type;
 pub mod has_special_stuff_type;
+pub mod nonrepeating_test_arg_type;
 pub mod person_type;
 pub mod pk_multi_identity_type;
 pub mod player_type;
@@ -1740,6 +2871,7 @@ pub mod player_table;
 pub mod test_d_table;
 pub mod test_f_table;
 pub mod my_player_table;
+pub mod test_e_view_table;
 pub mod get_my_schema_via_http_procedure;
 pub mod return_value_procedure;
 pub mod sleep_one_second_procedure;
@@ -1748,6 +2880,7 @@ pub mod with_tx_procedure;
 pub use baz_type::Baz;
 pub use foobar_type::Foobar;
 pub use has_special_stuff_type::HasSpecialStuff;
+pub use nonrepeating_test_arg_type::NonrepeatingTestArg;
 pub use person_type::Person;
 pub use pk_multi_identity_type::PkMultiIdentity;
 pub use player_type::Player;
@@ -1767,6 +2900,7 @@ pub use my_player_table::*;
 pub use person_table::*;
 pub use player_table::*;
 pub use test_d_table::*;
+pub use test_e_view_table::*;
 pub use test_f_table::*;
 pub use add_reducer::add;
 pub use add_player_reducer::add_player;
@@ -1918,6 +3052,7 @@ pub struct DbUpdate {
     person: __sdk::TableUpdate<Person>,
     player: __sdk::TableUpdate<Player>,
     test_d: __sdk::TableUpdate<TestD>,
+    test_e_view: __sdk::TableUpdate<TestE>,
     test_f: __sdk::TableUpdate<TestFoobar>,
 }
 
@@ -1934,6 +3069,7 @@ impl TryFrom<__ws::v2::TransactionUpdate> for DbUpdate {
     "person" => db_update.person.append(person_table::parse_table_update(table_update)?),
     "player" => db_update.player.append(player_table::parse_table_update(table_update)?),
     "test_d" => db_update.test_d.append(test_d_table::parse_table_update(table_update)?),
+    "test_e_view" => db_update.test_e_view.append(test_e_view_table::parse_table_update(table_update)?),
     "test_f" => db_update.test_f.append(test_f_table::parse_table_update(table_update)?),
 
                 unknown => {
@@ -1963,6 +3099,7 @@ impl __sdk::DbUpdate for DbUpdate {
         diff.test_d = cache.apply_diff_to_table::<TestD>("test_d", &self.test_d);
         diff.test_f = cache.apply_diff_to_table::<TestFoobar>("test_f", &self.test_f);
         diff.my_player = cache.apply_diff_to_table::<Player>("my_player", &self.my_player);
+        diff.test_e_view = cache.apply_diff_to_table::<TestE>("test_e_view", &self.test_e_view).with_updates_by_pk(|row| &row.id);
 
                     diff
                 }
@@ -1975,6 +3112,7 @@ for table_rows in raw.tables {
                 "person" => db_update.person.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "player" => db_update.player.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "test_d" => db_update.test_d.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
+                "test_e_view" => db_update.test_e_view.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 "test_f" => db_update.test_f.append(__sdk::parse_row_list_as_inserts(table_rows.rows)?),
                 unknown => { return Err(__sdk::InternalError::unknown_name("table", unknown, "QueryRows").into()); }
 }}        Ok(db_update)
@@ -1988,6 +3126,7 @@ for table_rows in raw.tables {
                 "person" => db_update.person.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "player" => db_update.player.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "test_d" => db_update.test_d.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
+                "test_e_view" => db_update.test_e_view.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 "test_f" => db_update.test_f.append(__sdk::parse_row_list_as_deletes(table_rows.rows)?),
                 unknown => { return Err(__sdk::InternalError::unknown_name("table", unknown, "QueryRows").into()); }
 }}        Ok(db_update)
@@ -2003,6 +3142,7 @@ pub struct AppliedDiff<'r> {
     person: __sdk::TableAppliedDiff<'r, Person>,
     player: __sdk::TableAppliedDiff<'r, Player>,
     test_d: __sdk::TableAppliedDiff<'r, TestD>,
+    test_e_view: __sdk::TableAppliedDiff<'r, TestE>,
     test_f: __sdk::TableAppliedDiff<'r, TestFoobar>,
     __unused: std::marker::PhantomData<&'r ()>,
 }
@@ -2019,6 +3159,7 @@ impl<'r> __sdk::AppliedDiff<'r> for AppliedDiff<'r> {
         callbacks.invoke_table_row_callbacks::<Person>("person", &self.person, event);
         callbacks.invoke_table_row_callbacks::<Player>("player", &self.player, event);
         callbacks.invoke_table_row_callbacks::<TestD>("test_d", &self.test_d, event);
+        callbacks.invoke_table_row_callbacks::<TestE>("test_e_view", &self.test_e_view, event);
         callbacks.invoke_table_row_callbacks::<TestFoobar>("test_f", &self.test_f, event);
 }
 }
@@ -2070,10 +3211,11 @@ impl __sdk::InModule for RemoteTables {
 /// You must explicitly advance the connection by calling any one of:
 ///
 /// - [`DbConnection::frame_tick`].
-/// - [`DbConnection::run_threaded`].
+#[cfg_attr(not(target_arch = "wasm32"), doc = "- [`DbConnection::run_threaded`].")]
+#[cfg_attr(target_arch = "wasm32", doc = "- [`DbConnection::run_background_task`].")]
 /// - [`DbConnection::run_async`].
 /// - [`DbConnection::advance_one_message`].
-/// - [`DbConnection::advance_one_message_blocking`].
+#[cfg_attr(not(target_arch =  "wasm32"), doc = "- [`DbConnection::advance_one_message_blocking`].")]
 /// - [`DbConnection::advance_one_message_async`].
 ///
 /// Which of these methods you should call depends on the specific needs of your application,
@@ -2171,6 +3313,7 @@ impl DbConnection {
     /// This is a low-level primitive exposed for power users who need significant control over scheduling.
     /// Most applications should call [`Self::run_threaded`] to spawn a thread
     /// which advances the connection automatically.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn advance_one_message_blocking(&self) -> __sdk::Result<()> {
         self.imp.advance_one_message_blocking()
     }
@@ -2196,8 +3339,15 @@ impl DbConnection {
     }
 
     /// Spawn a thread which processes WebSocket messages as they are received.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn run_threaded(&self) -> std::thread::JoinHandle<()> {
         self.imp.run_threaded()
+    }
+
+    /// Spawn a background task which processes WebSocket messages as they are received.
+    #[cfg(target_arch = "wasm32")]
+    pub fn run_background_task(&self) {
+        self.imp.run_background_task()
     }
 
     /// Run an `async` loop which processes WebSocket messages when polled.
@@ -2667,6 +3817,7 @@ fn register_tables(client_cache: &mut __sdk::ClientCache<Self>) {
         person_table::register_table(client_cache);
         player_table::register_table(client_cache);
         test_d_table::register_table(client_cache);
+        test_e_view_table::register_table(client_cache);
         test_f_table::register_table(client_cache);
 }
 const ALL_TABLE_NAMES: &'static [&'static str] = &[
@@ -2675,6 +3826,7 @@ const ALL_TABLE_NAMES: &'static [&'static str] = &[
         "person",
         "player",
         "test_d",
+        "test_e_view",
         "test_f",
 ];
 }
@@ -2705,6 +3857,18 @@ pub struct MyPlayerTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `my_player`.
+pub struct MyPlayerTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for MyPlayerTableAccessor {
+    type Row = Player;
+    type Handle<'db> = MyPlayerTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.my_player()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `my_player`.
 ///
@@ -2727,6 +3891,14 @@ impl MyPlayerTableAccess for super::RemoteTables {
 pub struct MyPlayerInsertCallbackId(__sdk::CallbackId);
 pub struct MyPlayerDeleteCallbackId(__sdk::CallbackId);
 
+impl<'ctx> __sdk::TableLike for MyPlayerTableHandle<'ctx> {
+    type Row = Player;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+}
+
 impl<'ctx> __sdk::Table for MyPlayerTableHandle<'ctx> {
     type Row = Player;
     type EventContext = super::EventContext;
@@ -2747,6 +3919,36 @@ impl<'ctx> __sdk::Table for MyPlayerTableHandle<'ctx> {
         self.imp.remove_on_insert(callback.0)
     }
 
+    type DeleteCallbackId = MyPlayerDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> MyPlayerDeleteCallbackId {
+        MyPlayerDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: MyPlayerDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithInsert for MyPlayerTableHandle<'ctx> {
+    type InsertCallbackId = MyPlayerInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> MyPlayerInsertCallbackId {
+        MyPlayerInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: MyPlayerInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for MyPlayerTableHandle<'ctx> {
     type DeleteCallbackId = MyPlayerDeleteCallbackId;
 
     fn on_delete(
@@ -2856,6 +4058,74 @@ impl __sdk::InModule for NamespaceTestF {
 }
 
 '''
+"nonrepeating_test_arg_type.rs" = '''
+// THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
+// WILL NOT BE SAVED. MODIFY TABLES IN YOUR MODULE SOURCE CODE INSTEAD.
+
+#![allow(unused, clippy::all)]
+use spacetimedb_sdk::__codegen::{
+	self as __sdk,
+	__lib,
+	__sats,
+	__ws,
+};
+
+
+#[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
+#[sats(crate = __lib)]
+pub struct NonrepeatingTestArg {
+    pub scheduled_id: u64,
+    pub scheduled_at: __sdk::ScheduleAt,
+    pub prev_time: __sdk::Timestamp,
+}
+
+
+impl __sdk::InModule for NonrepeatingTestArg {
+    type Module = super::RemoteModule;
+}
+
+
+/// Column accessor struct for the table `NonrepeatingTestArg`.
+///
+/// Provides typed access to columns for query building.
+pub struct NonrepeatingTestArgCols {
+    pub scheduled_id: __sdk::__query_builder::Col<NonrepeatingTestArg, u64>,
+    pub scheduled_at: __sdk::__query_builder::Col<NonrepeatingTestArg, __sdk::ScheduleAt>,
+    pub prev_time: __sdk::__query_builder::Col<NonrepeatingTestArg, __sdk::Timestamp>,
+}
+
+impl __sdk::__query_builder::HasCols for NonrepeatingTestArg {
+    type Cols = NonrepeatingTestArgCols;
+    fn cols(table_name: &'static str) -> Self::Cols {
+        NonrepeatingTestArgCols {
+            scheduled_id: __sdk::__query_builder::Col::new(table_name, "scheduled_id"),
+            scheduled_at: __sdk::__query_builder::Col::new(table_name, "scheduled_at"),
+            prev_time: __sdk::__query_builder::Col::new(table_name, "prev_time"),
+
+        }
+    }
+}
+
+/// Indexed column accessor struct for the table `NonrepeatingTestArg`.
+///
+/// Provides typed access to indexed columns for query building.
+pub struct NonrepeatingTestArgIxCols {
+    pub scheduled_id: __sdk::__query_builder::IxCol<NonrepeatingTestArg, u64>,
+}
+
+impl __sdk::__query_builder::HasIxCols for NonrepeatingTestArg {
+    type IxCols = NonrepeatingTestArgIxCols;
+    fn ix_cols(table_name: &'static str) -> Self::IxCols {
+        NonrepeatingTestArgIxCols {
+            scheduled_id: __sdk::__query_builder::IxCol::new(table_name, "scheduled_id"),
+
+        }
+    }
+}
+
+impl __sdk::__query_builder::CanBeLookupTable for NonrepeatingTestArg {}
+
+'''
 "person_table.rs" = '''
 // THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
 // WILL NOT BE SAVED. MODIFY TABLES IN YOUR MODULE SOURCE CODE INSTEAD.
@@ -2882,6 +4152,18 @@ pub struct PersonTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `person`.
+pub struct PersonTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for PersonTableAccessor {
+    type Row = Person;
+    type Handle<'db> = PersonTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.person()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `person`.
 ///
@@ -2903,6 +4185,14 @@ impl PersonTableAccess for super::RemoteTables {
 
 pub struct PersonInsertCallbackId(__sdk::CallbackId);
 pub struct PersonDeleteCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableLike for PersonTableHandle<'ctx> {
+    type Row = Person;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = Person> + '_ { self.imp.iter() }
+}
 
 impl<'ctx> __sdk::Table for PersonTableHandle<'ctx> {
     type Row = Person;
@@ -2938,9 +4228,54 @@ impl<'ctx> __sdk::Table for PersonTableHandle<'ctx> {
     }
 }
 
+impl<'ctx> __sdk::WithInsert for PersonTableHandle<'ctx> {
+    type InsertCallbackId = PersonInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> PersonInsertCallbackId {
+        PersonInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: PersonInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for PersonTableHandle<'ctx> {
+    type DeleteCallbackId = PersonDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> PersonDeleteCallbackId {
+        PersonDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: PersonDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
 pub struct PersonUpdateCallbackId(__sdk::CallbackId);
 
 impl<'ctx> __sdk::TableWithPrimaryKey for PersonTableHandle<'ctx> {
+    type UpdateCallbackId = PersonUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> PersonUpdateCallbackId {
+        PersonUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: PersonUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithUpdate for PersonTableHandle<'ctx> {
     type UpdateCallbackId = PersonUpdateCallbackId;
 
     fn on_update(
@@ -3184,6 +4519,18 @@ pub struct PlayerTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `player`.
+pub struct PlayerTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for PlayerTableAccessor {
+    type Row = Player;
+    type Handle<'db> = PlayerTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.player()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `player`.
 ///
@@ -3205,6 +4552,14 @@ impl PlayerTableAccess for super::RemoteTables {
 
 pub struct PlayerInsertCallbackId(__sdk::CallbackId);
 pub struct PlayerDeleteCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableLike for PlayerTableHandle<'ctx> {
+    type Row = Player;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = Player> + '_ { self.imp.iter() }
+}
 
 impl<'ctx> __sdk::Table for PlayerTableHandle<'ctx> {
     type Row = Player;
@@ -3240,9 +4595,54 @@ impl<'ctx> __sdk::Table for PlayerTableHandle<'ctx> {
     }
 }
 
+impl<'ctx> __sdk::WithInsert for PlayerTableHandle<'ctx> {
+    type InsertCallbackId = PlayerInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> PlayerInsertCallbackId {
+        PlayerInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: PlayerInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for PlayerTableHandle<'ctx> {
+    type DeleteCallbackId = PlayerDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> PlayerDeleteCallbackId {
+        PlayerDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: PlayerDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
 pub struct PlayerUpdateCallbackId(__sdk::CallbackId);
 
 impl<'ctx> __sdk::TableWithPrimaryKey for PlayerTableHandle<'ctx> {
+    type UpdateCallbackId = PlayerUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> PlayerUpdateCallbackId {
+        PlayerUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: PlayerUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithUpdate for PlayerTableHandle<'ctx> {
     type UpdateCallbackId = PlayerUpdateCallbackId;
 
     fn on_update(
@@ -3622,7 +5022,7 @@ pub trait query_private {
     ///
     /// Use [`query_private::query_private_then`] to run a callback after the reducer completes.
     fn query_private(&self, ) -> __sdk::Result<()> {
-        self.query_private_then(, |_, _| {})
+        self.query_private_then(|_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `query_private` to run as soon as possible,
@@ -3633,7 +5033,6 @@ pub trait query_private {
     ///  and its status can be observed with the `callback`.
     fn query_private_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -3643,7 +5042,6 @@ pub trait query_private {
 impl query_private for super::RemoteReducers {
     fn query_private_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -3881,7 +5279,7 @@ pub trait say_hello {
     ///
     /// Use [`say_hello::say_hello_then`] to run a callback after the reducer completes.
     fn say_hello(&self, ) -> __sdk::Result<()> {
-        self.say_hello_then(, |_, _| {})
+        self.say_hello_then(|_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `say_hello` to run as soon as possible,
@@ -3892,7 +5290,6 @@ pub trait say_hello {
     ///  and its status can be observed with the `callback`.
     fn say_hello_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -3902,7 +5299,6 @@ pub trait say_hello {
 impl say_hello for super::RemoteReducers {
     fn say_hello_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -4100,7 +5496,7 @@ pub trait test_btree_index_args {
     ///
     /// Use [`test_btree_index_args::test_btree_index_args_then`] to run a callback after the reducer completes.
     fn test_btree_index_args(&self, ) -> __sdk::Result<()> {
-        self.test_btree_index_args_then(, |_, _| {})
+        self.test_btree_index_args_then(|_, _| {})
     }
 
     /// Request that the remote module invoke the reducer `test_btree_index_args` to run as soon as possible,
@@ -4111,7 +5507,6 @@ pub trait test_btree_index_args {
     ///  and its status can be observed with the `callback`.
     fn test_btree_index_args_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -4121,7 +5516,6 @@ pub trait test_btree_index_args {
 impl test_btree_index_args for super::RemoteReducers {
     fn test_btree_index_args_then(
         &self,
-        ,
         callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
             + Send
             + 'static,
@@ -4157,6 +5551,18 @@ pub struct TestDTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `test_d`.
+pub struct TestDTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for TestDTableAccessor {
+    type Row = TestD;
+    type Handle<'db> = TestDTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.test_d()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `test_d`.
 ///
@@ -4179,6 +5585,14 @@ impl TestDTableAccess for super::RemoteTables {
 pub struct TestDInsertCallbackId(__sdk::CallbackId);
 pub struct TestDDeleteCallbackId(__sdk::CallbackId);
 
+impl<'ctx> __sdk::TableLike for TestDTableHandle<'ctx> {
+    type Row = TestD;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = TestD> + '_ { self.imp.iter() }
+}
+
 impl<'ctx> __sdk::Table for TestDTableHandle<'ctx> {
     type Row = TestD;
     type EventContext = super::EventContext;
@@ -4199,6 +5613,36 @@ impl<'ctx> __sdk::Table for TestDTableHandle<'ctx> {
         self.imp.remove_on_insert(callback.0)
     }
 
+    type DeleteCallbackId = TestDDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestDDeleteCallbackId {
+        TestDDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: TestDDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithInsert for TestDTableHandle<'ctx> {
+    type InsertCallbackId = TestDInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestDInsertCallbackId {
+        TestDInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: TestDInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for TestDTableHandle<'ctx> {
     type DeleteCallbackId = TestDDeleteCallbackId;
 
     fn on_delete(
@@ -4266,6 +5710,7 @@ use super::namespace_test_c_type::NamespaceTestC;
 #[sats(crate = __lib)]
 pub struct TestD {
     pub test_c: Option::<NamespaceTestC>,
+    pub test_c_nested: Option::<Vec::<NamespaceTestC>>,
 }
 
 
@@ -4279,6 +5724,7 @@ impl __sdk::InModule for TestD {
 /// Provides typed access to columns for query building.
 pub struct TestDCols {
     pub test_c: __sdk::__query_builder::Col<TestD, Option::<NamespaceTestC>>,
+    pub test_c_nested: __sdk::__query_builder::Col<TestD, Option::<Vec::<NamespaceTestC>>>,
 }
 
 impl __sdk::__query_builder::HasCols for TestD {
@@ -4286,6 +5732,7 @@ impl __sdk::__query_builder::HasCols for TestD {
     fn cols(table_name: &'static str) -> Self::Cols {
         TestDCols {
             test_c: __sdk::__query_builder::Col::new(table_name, "test_c"),
+            test_c_nested: __sdk::__query_builder::Col::new(table_name, "test_c_nested"),
 
         }
     }
@@ -4376,6 +5823,236 @@ impl __sdk::__query_builder::HasIxCols for TestE {
 impl __sdk::__query_builder::CanBeLookupTable for TestE {}
 
 '''
+"test_e_view_table.rs" = '''
+// THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
+// WILL NOT BE SAVED. MODIFY TABLES IN YOUR MODULE SOURCE CODE INSTEAD.
+
+#![allow(unused, clippy::all)]
+use spacetimedb_sdk::__codegen::{
+	self as __sdk,
+	__lib,
+	__sats,
+	__ws,
+};
+use super::test_e_type::TestE;
+
+/// Table handle for the table `test_e_view`.
+///
+/// Obtain a handle from the [`TestEViewTableAccess::test_e_view`] method on [`super::RemoteTables`],
+/// like `ctx.db.test_e_view()`.
+///
+/// Users are encouraged not to explicitly reference this type,
+/// but to directly chain method calls,
+/// like `ctx.db.test_e_view().on_insert(...)`.
+pub struct TestEViewTableHandle<'ctx> {
+    imp: __sdk::TableHandle<TestE>,
+    ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
+}
+
+/// Lifetime-aware accessor marker for the table `test_e_view`.
+pub struct TestEViewTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for TestEViewTableAccessor {
+    type Row = TestE;
+    type Handle<'db> = TestEViewTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.test_e_view()
+    }
+}
+
+#[allow(non_camel_case_types)]
+/// Extension trait for access to the table `test_e_view`.
+///
+/// Implemented for [`super::RemoteTables`].
+pub trait TestEViewTableAccess {
+    #[allow(non_snake_case)]
+    /// Obtain a [`TestEViewTableHandle`], which mediates access to the table `test_e_view`.
+    fn test_e_view(&self) -> TestEViewTableHandle<'_>;
+}
+
+impl TestEViewTableAccess for super::RemoteTables {
+    fn test_e_view(&self) -> TestEViewTableHandle<'_> {
+        TestEViewTableHandle {
+            imp: self.imp.get_table::<TestE>("test_e_view"),
+            ctx: std::marker::PhantomData,
+        }
+    }
+}
+
+pub struct TestEViewInsertCallbackId(__sdk::CallbackId);
+pub struct TestEViewDeleteCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableLike for TestEViewTableHandle<'ctx> {
+    type Row = TestE;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = TestE> + '_ { self.imp.iter() }
+}
+
+impl<'ctx> __sdk::Table for TestEViewTableHandle<'ctx> {
+    type Row = TestE;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = TestE> + '_ { self.imp.iter() }
+
+    type InsertCallbackId = TestEViewInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestEViewInsertCallbackId {
+        TestEViewInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: TestEViewInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+
+    type DeleteCallbackId = TestEViewDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestEViewDeleteCallbackId {
+        TestEViewDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: TestEViewDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithInsert for TestEViewTableHandle<'ctx> {
+    type InsertCallbackId = TestEViewInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestEViewInsertCallbackId {
+        TestEViewInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: TestEViewInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for TestEViewTableHandle<'ctx> {
+    type DeleteCallbackId = TestEViewDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestEViewDeleteCallbackId {
+        TestEViewDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: TestEViewDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
+pub struct TestEViewUpdateCallbackId(__sdk::CallbackId);
+
+impl<'ctx> __sdk::TableWithPrimaryKey for TestEViewTableHandle<'ctx> {
+    type UpdateCallbackId = TestEViewUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> TestEViewUpdateCallbackId {
+        TestEViewUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: TestEViewUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithUpdate for TestEViewTableHandle<'ctx> {
+    type UpdateCallbackId = TestEViewUpdateCallbackId;
+
+    fn on_update(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row, &Self::Row) + Send + 'static,
+    ) -> TestEViewUpdateCallbackId {
+        TestEViewUpdateCallbackId(self.imp.on_update(Box::new(callback)))
+    }
+
+    fn remove_on_update(&self, callback: TestEViewUpdateCallbackId) {
+        self.imp.remove_on_update(callback.0)
+    }
+}
+
+        /// Access to the `id` unique index on the table `test_e_view`,
+        /// which allows point queries on the field of the same name
+        /// via the [`TestEViewIdUnique::find`] method.
+        ///
+        /// Users are encouraged not to explicitly reference this type,
+        /// but to directly chain method calls,
+        /// like `ctx.db.test_e_view().id().find(...)`.
+        pub struct TestEViewIdUnique<'ctx> {
+            imp: __sdk::UniqueConstraintHandle<TestE, u64>,
+            phantom: std::marker::PhantomData<&'ctx super::RemoteTables>,
+        }
+
+        impl<'ctx> TestEViewTableHandle<'ctx> {
+            /// Get a handle on the `id` unique index on the table `test_e_view`.
+            pub fn id(&self) -> TestEViewIdUnique<'ctx> {
+                TestEViewIdUnique {
+                    imp: self.imp.get_unique_constraint::<u64>("id"),
+                    phantom: std::marker::PhantomData,
+                }
+            }
+        }
+
+        impl<'ctx> TestEViewIdUnique<'ctx> {
+            /// Find the subscribed row whose `id` column value is equal to `col_val`,
+            /// if such a row is present in the client cache.
+            pub fn find(&self, col_val: &u64) -> Option<TestE> {
+                self.imp.find(col_val)
+            }
+        }
+        
+#[doc(hidden)]
+pub(super) fn register_table(client_cache: &mut __sdk::ClientCache<super::RemoteModule>) {
+
+    let _table = client_cache.get_or_make_table::<TestE>("test_e_view");
+    _table.add_unique_constraint::<u64>("id", |row| &row.id);
+}
+
+#[doc(hidden)]
+pub(super) fn parse_table_update(
+    raw_updates: __ws::v2::TableUpdate,
+) -> __sdk::Result<__sdk::TableUpdate<TestE>> {
+    __sdk::TableUpdate::parse_table_update(raw_updates).map_err(|e| {
+        __sdk::InternalError::failed_parse(
+            "TableUpdate<TestE>",
+            "TableUpdate",
+        ).with_cause(e).into()
+    })
+}
+
+        #[allow(non_camel_case_types)]
+        /// Extension trait for query builder access to the table `TestE`.
+        ///
+        /// Implemented for [`__sdk::QueryTableAccessor`].
+        pub trait test_e_viewQueryTableAccess {
+            #[allow(non_snake_case)]
+            /// Get a query builder for the table `TestE`.
+            fn test_e_view(&self) -> __sdk::__query_builder::Table<TestE>;
+        }
+
+        impl test_e_viewQueryTableAccess for __sdk::QueryTableAccessor {
+            fn test_e_view(&self) -> __sdk::__query_builder::Table<TestE> {
+                __sdk::__query_builder::Table::new("test_e_view")
+            }
+        }
+
+'''
 "test_f_table.rs" = '''
 // THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
 // WILL NOT BE SAVED. MODIFY TABLES IN YOUR MODULE SOURCE CODE INSTEAD.
@@ -4403,6 +6080,18 @@ pub struct TestFTableHandle<'ctx> {
     ctx: std::marker::PhantomData<&'ctx super::RemoteTables>,
 }
 
+/// Lifetime-aware accessor marker for the table `test_f`.
+pub struct TestFTableAccessor;
+
+impl __sdk::TableAccessor<super::RemoteTables> for TestFTableAccessor {
+    type Row = TestFoobar;
+    type Handle<'db> = TestFTableHandle<'db>;
+
+    fn get<'db>(db: &'db super::RemoteTables) -> Self::Handle<'db> {
+        db.test_f()
+    }
+}
+
 #[allow(non_camel_case_types)]
 /// Extension trait for access to the table `test_f`.
 ///
@@ -4425,6 +6114,14 @@ impl TestFTableAccess for super::RemoteTables {
 pub struct TestFInsertCallbackId(__sdk::CallbackId);
 pub struct TestFDeleteCallbackId(__sdk::CallbackId);
 
+impl<'ctx> __sdk::TableLike for TestFTableHandle<'ctx> {
+    type Row = TestFoobar;
+    type EventContext = super::EventContext;
+
+    fn count(&self) -> u64 { self.imp.count() }
+    fn iter(&self) -> impl Iterator<Item = TestFoobar> + '_ { self.imp.iter() }
+}
+
 impl<'ctx> __sdk::Table for TestFTableHandle<'ctx> {
     type Row = TestFoobar;
     type EventContext = super::EventContext;
@@ -4445,6 +6142,36 @@ impl<'ctx> __sdk::Table for TestFTableHandle<'ctx> {
         self.imp.remove_on_insert(callback.0)
     }
 
+    type DeleteCallbackId = TestFDeleteCallbackId;
+
+    fn on_delete(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestFDeleteCallbackId {
+        TestFDeleteCallbackId(self.imp.on_delete(Box::new(callback)))
+    }
+
+    fn remove_on_delete(&self, callback: TestFDeleteCallbackId) {
+        self.imp.remove_on_delete(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithInsert for TestFTableHandle<'ctx> {
+    type InsertCallbackId = TestFInsertCallbackId;
+
+    fn on_insert(
+        &self,
+        callback: impl FnMut(&Self::EventContext, &Self::Row) + Send + 'static,
+    ) -> TestFInsertCallbackId {
+        TestFInsertCallbackId(self.imp.on_insert(Box::new(callback)))
+    }
+
+    fn remove_on_insert(&self, callback: TestFInsertCallbackId) {
+        self.imp.remove_on_insert(callback.0)
+    }
+}
+
+impl<'ctx> __sdk::WithDelete for TestFTableHandle<'ctx> {
     type DeleteCallbackId = TestFDeleteCallbackId;
 
     fn on_delete(
