@@ -417,8 +417,6 @@ struct ProcedureInfo {
     name_snake: String,
     /// Original procedure name as declared in the module
     name_orig: String,
-    /// Parameter list formatted as "name: Type, name: Type"
-    arglist: String,
     /// Parameter names formatted as "name, name"
     arg_names: String,
     /// Closure parameter list formatted as "name: Type, name: Type"
@@ -477,7 +475,6 @@ fn collect_procedures(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<
             // We pass it to type_name_for_hook to handle any potential name conflicts.
             let wrapper_struct_name = proc.accessor_name.deref().to_case(Case::Pascal) + "Args";
 
-            let mut arglist = String::new();
             let mut arg_names = String::new();
             let mut closure_params = String::new();
             let mut fn_trait_params = String::new();
@@ -487,12 +484,10 @@ fn collect_procedures(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<
                 let arg_type = type_name_for_hook(module, arg_ty, &wrapper_struct_name);
 
                 if i > 0 {
-                    arglist.push_str(", ");
                     arg_names.push_str(", ");
                     closure_params.push_str(", ");
                     fn_trait_params.push_str(", ");
                 }
-                arglist.push_str(&format!("{arg_name}: {arg_type}"));
                 arg_names.push_str(&arg_name);
                 closure_params.push_str(&format!("{arg_name}: {arg_type}"));
                 fn_trait_params.push_str(&arg_type.to_string());
@@ -509,7 +504,6 @@ fn collect_procedures(module: &ModuleDef, visibility: CodegenVisibility) -> Vec<
             ProcedureInfo {
                 name_snake,
                 name_orig,
-                arglist,
                 arg_names,
                 closure_params,
                 fn_trait_params,
@@ -589,6 +583,7 @@ fn generate_dioxus_hooks(module: &ModuleDef, visibility: CodegenVisibility) -> O
         "use spacetimedb_sdk::{{DbContext, Table, TableWithPrimaryKey, Identity}};"
     );
     writeln!(out, "use std::sync::{{Arc, Mutex}};");
+    writeln!(out, "use futures_channel::oneshot;");
     writeln!(out);
 
     // SharedConnection type alias
@@ -1305,7 +1300,7 @@ fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
     writeln!(out, "#[must_use]");
 
     let fn_type = if fn_trait_params.is_empty() {
-        format!("impl Fn() + Clone + 'static")
+        "impl Fn() + Clone + 'static".to_string()
     } else {
         format!("impl Fn({fn_trait_params}) + Clone + 'static")
     };
@@ -1316,14 +1311,16 @@ fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
     writeln!(out, "    let conn_signal = use_connection();");
     writeln!(
         out,
-        "    let result: SyncSignal<Option<Result<{ret}, String>>> = use_signal_sync(|| None);",
+        "    let mut result: SyncSignal<Option<Result<{ret}, String>>> = use_signal_sync(|| None);",
     );
     writeln!(out);
     writeln!(out, "    let invoke = move |{}| {{", proc.closure_params);
+    writeln!(out, "        let mut result = result;");
+    writeln!(out, "        result.set(None);");
     writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{");
-    writeln!(out, "            let mut result = result;");
+    writeln!(out, "            let (tx, rx) = oneshot::channel();");
     if proc.arg_names.is_empty() {
-        writeln!(out, "            conn.procedures.{name_snake}_then(move |_ctx, res| {{",);
+        writeln!(out, "            conn.procedures.{name_snake}_then(move |_ctx, res| {{");
     } else {
         writeln!(
             out,
@@ -1331,55 +1328,249 @@ fn write_procedure_hook(out: &mut Indenter, proc: &ProcedureInfo) {
             proc.arg_names,
         );
     }
-    writeln!(out, "                result.set(Some(res.map_err(|e| e.to_string())));");
+    writeln!(out, "                let _ = tx.send(res);");
     writeln!(out, "            }});");
+    writeln!(out, "            spawn(async move {{");
+    writeln!(out, "                if let Ok(res) = rx.await {{");
+    writeln!(out, "                    result.set(Some(res.map_err(|e| e.to_string())));");
+    writeln!(out, "                }}");
+    writeln!(out, "            }});");
+    writeln!(out, "        }} else {{");
+    writeln!(out, "            result.set(Some(Err(\"Disconnected from SpacetimeDB\".to_string())));");
     writeln!(out, "        }}");
     writeln!(out, "    }};");
     writeln!(out);
     writeln!(out, "    (invoke, result)");
     writeln!(out, "}}");
+    writeln!(out);
+
+    // use_procedure_{name}_async
+    writeln!(
+        out,
+        "/// Invoke the `{name_orig}` procedure asynchronously.",
+    );
+    writeln!(out, "///");
+    writeln!(
+        out,
+        "/// Returns a closure that can be called to invoke the procedure and `await` the response directly.",
+    );
+    writeln!(out, "#[must_use]");
+    let async_fn_type = if fn_trait_params.is_empty() {
+        format!("impl Fn() -> impl std::future::Future<Output = Result<{ret}, String>> + Clone + 'static")
+    } else {
+        format!("impl Fn({fn_trait_params}) -> impl std::future::Future<Output = Result<{ret}, String>> + Clone + 'static")
+    };
+    writeln!(
+        out,
+        "pub fn use_procedure_{name_snake}_async() -> {async_fn_type} {{",
+    );
+    writeln!(out, "    let conn_signal = use_connection();");
+    writeln!(out);
+    writeln!(out, "    move |{}| {{", proc.closure_params);
+    writeln!(out, "        let conn = conn_signal();");
+    writeln!(out, "        async move {{");
+    writeln!(out, "            let Some(conn) = conn.as_ref() else {{");
+    writeln!(out, "                return Err(\"Disconnected from SpacetimeDB\".to_string());");
+    writeln!(out, "            }};");
+    writeln!(out, "            let (tx, rx) = oneshot::channel();");
+    if proc.arg_names.is_empty() {
+        writeln!(out, "            conn.procedures.{name_snake}_then(move |_ctx, res| {{");
+    } else {
+        writeln!(
+            out,
+            "            conn.procedures.{name_snake}_then({}, move |_ctx, res| {{",
+            proc.arg_names,
+        );
+    }
+    writeln!(out, "                let _ = tx.send(res);");
+    writeln!(out, "            }});");
+    writeln!(out, "            match rx.await {{");
+    writeln!(out, "                Ok(res) => res.map_err(|e| e.to_string()),");
+    writeln!(out, "                Err(_) => Err(\"Request cancelled\".to_string()),");
+    writeln!(out, "            }}");
+    writeln!(out, "        }}");
+    writeln!(out, "    }}");
+    writeln!(out, "}}");
 }
 
 fn write_reducer_hook(out: &mut Indenter, reducer: &ReducerInfo) {
-    writeln!(out, "/// Get a callback to invoke the `{}` reducer.", reducer.name_orig,);
+    let name_orig = &reducer.name_orig;
+    let name_snake = &reducer.name_snake;
+    let fn_trait_params = &reducer.fn_trait_params;
+    let closure_params = &reducer.closure_params;
+    let arg_names = &reducer.arg_names;
+
+    writeln!(out, "/// Get a callback to invoke the `{name_orig}` reducer.");
     writeln!(out, "#[must_use]");
 
     if reducer.arglist.is_empty() {
         // No-argument reducer
         writeln!(
             out,
-            "pub fn use_reducer_{}() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {{",
-            reducer.name_snake,
+            "pub fn use_reducer_{name_snake}() -> impl Fn() -> spacetimedb_sdk::Result<()> + Clone + 'static {{",
         );
         writeln!(out, "    let conn_signal = use_connection();");
         writeln!(out);
         writeln!(out, "    move || {{");
         writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{",);
-        writeln!(out, "            conn.reducers.{}()", reducer.name_snake);
+        writeln!(out, "            conn.reducers.{name_snake}()");
         writeln!(out, "        }} else {{");
         writeln!(out, "            Err(spacetimedb_sdk::Error::Disconnected)");
         writeln!(out, "        }}");
         writeln!(out, "    }}");
+        writeln!(out, "}}");
     } else {
         // Reducer with arguments
         writeln!(
             out,
-            "pub fn use_reducer_{}() -> impl Fn({}) -> spacetimedb_sdk::Result<()> + Clone + 'static {{",
-            reducer.name_snake, reducer.fn_trait_params,
+            "pub fn use_reducer_{name_snake}() -> impl Fn({fn_trait_params}) -> spacetimedb_sdk::Result<()> + Clone + 'static {{",
         );
         writeln!(out, "    let conn_signal = use_connection();");
         writeln!(out);
-        writeln!(out, "    move |{}| {{", reducer.closure_params);
+        writeln!(out, "    move |{closure_params}| {{");
         writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{",);
         writeln!(
             out,
-            "            conn.reducers.{}({})",
-            reducer.name_snake, reducer.arg_names,
+            "            conn.reducers.{name_snake}({arg_names})",
         );
         writeln!(out, "        }} else {{");
         writeln!(out, "            Err(spacetimedb_sdk::Error::Disconnected)");
         writeln!(out, "        }}");
         writeln!(out, "    }}");
+        writeln!(out, "}}");
     }
+
+    writeln!(out);
+
+    // use_reducer_{name}_then
+    writeln!(
+        out,
+        "/// Invoke the `{name_orig}` reducer and get a reactive signal for its completion status.",
+    );
+    writeln!(out, "///");
+    writeln!(
+        out,
+        "/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.",
+    );
+    writeln!(
+        out,
+        "/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`",
+    );
+    writeln!(out, "/// on failure once the server notifies completion.");
+    writeln!(out, "#[must_use]");
+
+    let fn_type = if fn_trait_params.is_empty() {
+        "impl Fn() + Clone + 'static".to_string()
+    } else {
+        format!("impl Fn({fn_trait_params}) + Clone + 'static")
+    };
+    writeln!(
+        out,
+        "pub fn use_reducer_{name_snake}_then() -> ({fn_type}, SyncSignal<Option<Result<(), String>>>) {{",
+    );
+    writeln!(out, "    let conn_signal = use_connection();");
+    writeln!(
+        out,
+        "    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);",
+    );
+    writeln!(out);
+    writeln!(out, "    let invoke = move |{closure_params}| {{");
+    writeln!(out, "        let mut result = result;");
+    writeln!(out, "        result.set(None);");
+    writeln!(out, "        if let Some(conn) = conn_signal().as_ref() {{");
+    writeln!(out, "            let (tx, rx) = oneshot::channel();");
+    if arg_names.is_empty() {
+        writeln!(
+            out,
+            "            if let Err(e) = conn.reducers.{name_snake}_then(move |_ctx, res| {{"
+        );
+    } else {
+        writeln!(
+            out,
+            "            if let Err(e) = conn.reducers.{name_snake}_then({arg_names}, move |_ctx, res| {{"
+        );
+    }
+    writeln!(out, "                let _ = tx.send(res);");
+    writeln!(out, "            }}) {{");
+    writeln!(out, "                result.set(Some(Err(e.to_string())));");
+    writeln!(out, "                return;");
+    writeln!(out, "            }}");
+    writeln!(out, "            spawn(async move {{");
+    writeln!(out, "                if let Ok(res) = rx.await {{");
+    writeln!(out, "                    let flattened = match res {{");
+    writeln!(out, "                        Ok(Ok(())) => Ok(()),");
+    writeln!(out, "                        Ok(Err(module_err)) => Err(module_err),");
+    writeln!(out, "                        Err(sdk_err) => Err(sdk_err.to_string()),");
+    writeln!(out, "                    }};");
+    writeln!(out, "                    result.set(Some(flattened));");
+    writeln!(out, "                }}");
+    writeln!(out, "            }});");
+    writeln!(out, "        }} else {{");
+    writeln!(
+        out,
+        "            result.set(Some(Err(\"Disconnected from SpacetimeDB\".to_string())));"
+    );
+    writeln!(out, "        }}");
+    writeln!(out, "    }};");
+    writeln!(out);
+    writeln!(out, "    (invoke, result)");
+    writeln!(out, "}}");
+    writeln!(out);
+
+    // use_reducer_{name}_async
+    writeln!(
+        out,
+        "/// Invoke the `{name_orig}` reducer asynchronously and await its completion.",
+    );
+    writeln!(out, "///");
+    writeln!(
+        out,
+        "/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.",
+    );
+    writeln!(out, "#[must_use]");
+    let async_fn_type = if fn_trait_params.is_empty() {
+        "impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static".to_string()
+    } else {
+        format!("impl Fn({fn_trait_params}) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static")
+    };
+    writeln!(
+        out,
+        "pub fn use_reducer_{name_snake}_async() -> {async_fn_type} {{",
+    );
+    writeln!(out, "    let conn_signal = use_connection();");
+    writeln!(out);
+    writeln!(out, "    move |{closure_params}| {{");
+    writeln!(out, "        let conn = conn_signal();");
+    writeln!(out, "        async move {{");
+    writeln!(out, "            let Some(conn) = conn.as_ref() else {{");
+    writeln!(
+        out,
+        "                return Err(\"Disconnected from SpacetimeDB\".to_string());"
+    );
+    writeln!(out, "            }};");
+    writeln!(out, "            let (tx, rx) = oneshot::channel();");
+    if arg_names.is_empty() {
+        writeln!(
+            out,
+            "            if let Err(e) = conn.reducers.{name_snake}_then(move |_ctx, res| {{"
+        );
+    } else {
+        writeln!(
+            out,
+            "            if let Err(e) = conn.reducers.{name_snake}_then({arg_names}, move |_ctx, res| {{"
+        );
+    }
+    writeln!(out, "                let _ = tx.send(res);");
+    writeln!(out, "            }}) {{");
+    writeln!(out, "                return Err(e.to_string());");
+    writeln!(out, "            }}");
+    writeln!(out, "            match rx.await {{");
+    writeln!(out, "                Ok(Ok(Ok(()))) => Ok(()),");
+    writeln!(out, "                Ok(Ok(Err(err))) => Err(err),");
+    writeln!(out, "                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),");
+    writeln!(out, "                Err(_) => Err(\"Request cancelled\".to_string()),");
+    writeln!(out, "            }}");
+    writeln!(out, "        }}");
+    writeln!(out, "    }}");
     writeln!(out, "}}");
 }
