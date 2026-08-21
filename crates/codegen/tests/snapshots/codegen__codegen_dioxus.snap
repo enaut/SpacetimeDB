@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen.rs
+assertion_line: 37
 expression: outfiles
 ---
 "add_player_reducer.rs" = '''
@@ -1063,7 +1064,7 @@ pub fn use_reducer_add_then() -> (impl Fn(String, u8) + Clone + 'static, SyncSig
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_add_async() -> impl Fn(String, u8) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_add_async() -> impl Fn(String, u8) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |name: String, age: u8| {
@@ -1145,7 +1146,7 @@ pub fn use_reducer_add_player_then() -> (impl Fn(String) + Clone + 'static, Sync
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_add_player_async() -> impl Fn(String) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_add_player_async() -> impl Fn(String) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |name: String| {
@@ -1227,7 +1228,7 @@ pub fn use_reducer_add_private_then() -> (impl Fn(String) + Clone + 'static, Syn
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_add_private_async() -> impl Fn(String) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_add_private_async() -> impl Fn(String) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |name: String| {
@@ -1309,7 +1310,7 @@ pub fn use_reducer_assert_caller_identity_is_module_identity_then() -> (impl Fn(
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_assert_caller_identity_is_module_identity_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_assert_caller_identity_is_module_identity_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -1391,7 +1392,7 @@ pub fn use_reducer_delete_player_then() -> (impl Fn(u64) + Clone + 'static, Sync
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_delete_player_async() -> impl Fn(u64) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_delete_player_async() -> impl Fn(u64) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |id: u64| {
@@ -1473,7 +1474,7 @@ pub fn use_reducer_delete_players_by_name_then() -> (impl Fn(String) + Clone + '
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_delete_players_by_name_async() -> impl Fn(String) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_delete_players_by_name_async() -> impl Fn(String) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |name: String| {
@@ -1555,7 +1556,7 @@ pub fn use_reducer_list_over_age_then() -> (impl Fn(u8) + Clone + 'static, SyncS
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_list_over_age_async() -> impl Fn(u8) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_list_over_age_async() -> impl Fn(u8) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |age: u8| {
@@ -1637,7 +1638,7 @@ pub fn use_reducer_log_module_identity_then() -> (impl Fn() + Clone + 'static, S
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_log_module_identity_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_log_module_identity_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -1719,7 +1720,7 @@ pub fn use_reducer_query_private_then() -> (impl Fn() + Clone + 'static, SyncSig
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_query_private_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_query_private_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -1801,7 +1802,7 @@ pub fn use_reducer_say_hello_then() -> (impl Fn() + Clone + 'static, SyncSignal<
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_say_hello_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_say_hello_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -1883,7 +1884,7 @@ pub fn use_reducer_test_then() -> (impl Fn(TestA, TestB, NamespaceTestC, Namespa
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_test_async() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_test_async() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |arg: TestA, arg_2: TestB, arg_3: NamespaceTestC, arg_4: NamespaceTestF| {
@@ -1965,7 +1966,7 @@ pub fn use_reducer_test_btree_index_args_then() -> (impl Fn() + Clone + 'static,
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_test_btree_index_args_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_reducer_test_btree_index_args_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -2027,7 +2028,7 @@ pub fn use_procedure_get_my_schema_via_http() -> (impl Fn() + Clone + 'static, S
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_get_my_schema_via_http_async() -> impl Fn() -> impl std::future::Future<Output = Result<String, String>> + Clone + 'static {
+pub fn use_procedure_get_my_schema_via_http_async() -> impl Fn() -> (impl std::future::Future<Output = Result<String, String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -2083,7 +2084,7 @@ pub fn use_procedure_return_value() -> (impl Fn(u64) + Clone + 'static, SyncSign
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_return_value_async() -> impl Fn(u64) -> impl std::future::Future<Output = Result<Baz, String>> + Clone + 'static {
+pub fn use_procedure_return_value_async() -> impl Fn(u64) -> (impl std::future::Future<Output = Result<Baz, String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move |foo: u64| {
@@ -2139,7 +2140,7 @@ pub fn use_procedure_sleep_one_second() -> (impl Fn() + Clone + 'static, SyncSig
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_sleep_one_second_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_procedure_sleep_one_second_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
@@ -2195,7 +2196,7 @@ pub fn use_procedure_with_tx() -> (impl Fn() + Clone + 'static, SyncSignal<Optio
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_with_tx_async() -> impl Fn() -> impl std::future::Future<Output = Result<(), String>> + Clone + 'static {
+pub fn use_procedure_with_tx_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
     let conn_signal = use_connection();
 
     move || {
