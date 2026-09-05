@@ -55,10 +55,10 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
             .status()
             .context("Failed to execute tsc")?;
         if !status.success() {
-            if let Some(code) = status.code()
-                && let Ok(code) = u8::try_from(code).map(ExitCode::from)
-            {
-                anyhow::bail!(ExitWithCode(code));
+            if let Some(code) = status.code() {
+                if let Ok(code) = u8::try_from(code).map(ExitCode::from) {
+                    anyhow::bail!(ExitWithCode(code));
+                }
             }
             // For an abnormal exit, show the details of the status.
             anyhow::bail!("tsc exited with {status}");
@@ -83,9 +83,7 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
         name: None,
         entry_filenames: None,
         chunk_filenames: None, // The pattern to use for naming shared chunks created when code-splitting
-        css_entry_filenames: None,
-        css_chunk_filenames: None, // We're not doing CSS
-        asset_filenames: None,     // assets/[name]-[hash][extname]
+        asset_filenames: None, // assets/[name]-[hash][extname]
         sanitize_filename: Some(rolldown::SanitizeFilename::Boolean(true)), // Replace characters that are invalid in filenames with underscores
         dir: None, // The output directory to write to. We only want a single output file, so we won't set this.
         file: Some("./dist/bundle.js".into()), // The output file to write to. We want a single output file.
@@ -160,6 +158,7 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
         code_splitting: None,               // Split a bundle into multiple chunks on dynamic `import()` boundaries.
         dynamic_import_in_cjs: None,        // Emit `import()` in CommonJS
         manual_code_splitting: None,        // Not relevant to us, this is for advanced code-splitting strategies.
+        comments: None,                     // Use default comment handling
         checks: Some(rolldown::ChecksOptions {
             circular_dependency: Some(true),           // Check circular dependencies
             eval: Some(false),                         // We don't care about eval
@@ -180,12 +179,14 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
             plugin_timings: None,
             duplicate_shebang: None,
             unsupported_tsconfig_option: None,
+            ineffective_dynamic_import: Some(true),
         }),
         transform: Some(rolldown::BundlerTransformOptions {
             jsx: None,                                       // Don't transform JSX
             target: Some(Either::Left("esnext".to_owned())), // Default, no transformation
             assumptions: None, // No compiler assumptions, we don't need to minmax output size
             decorator: None,   // Disable experimental decorators
+            helpers: None,     // Use default helper handling
             typescript: Some(rolldown::TypeScriptOptions {
                 jsx_pragma: None,                                     // I am unclear on what this is
                 jsx_pragma_frag: None,                                // I am unclear on what this is
@@ -217,6 +218,7 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
         clean_dir: None,
         context: None, // We don't want a top level `this` in modules
         tsconfig: Some(rolldown::TsConfig::Manual(cwd.join("tsconfig.json"))),
+        strict: None,
         strict_execution_order: None,
     })?;
 
