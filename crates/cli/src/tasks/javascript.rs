@@ -101,6 +101,7 @@ pub(crate) fn build_javascript(project_path: &Path, build_debug: bool) -> anyhow
         css_entry_filenames: None,
         css_chunk_filenames: None, // We're not doing CSS
         asset_filenames: None,     // assets/[name]-[hash][extname]
+
         sanitize_filename: Some(rolldown::SanitizeFilename::Boolean(true)), // Replace characters that are invalid in filenames with underscores
         dir: None, // The output directory to write to. We only want a single output file, so we won't set this.
         file: Some("./dist/bundle.js".into()), // The output file to write to. We want a single output file.
