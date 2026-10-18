@@ -1,6 +1,5 @@
 ---
 source: crates/codegen/tests/codegen.rs
-assertion_line: 37
 expression: outfiles
 ---
 "add_player_reducer.rs" = '''
@@ -607,14 +606,35 @@ async fn reconnect_sleep(delay_ms: u64) {
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = delay_ms;
+        let delay_clamped = delay_ms.min(i32::MAX as u64) as i32;
+        let promise = js_sys::Promise::new(&mut |resolve, _| {
+            if let Some(window) = web_sys::window() {
+                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                    &resolve,
+                    delay_clamped,
+                );
+            }
+        });
+        let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
     }
 }
 
 #[must_use]
 fn is_fatal_connection_error(err: &spacetimedb_sdk::Error) -> bool {
     let msg = err.to_string().to_ascii_lowercase();
-    msg.contains("unauthorized")
+    msg.contains("http error: 401")
+        || msg.contains("http error: 403")
+        || msg.contains("status: 401")
+        || msg.contains("status: 403")
+        || msg.contains("status 401")
+        || msg.contains("status 403")
+        || msg.contains(": 401")
+        || msg.contains(": 403")
+        || msg.contains(" 401 ")
+        || msg.contains(" 403 ")
+        || msg.ends_with(" 401")
+        || msg.ends_with(" 403")
+        || msg.contains("unauthorized")
         || msg.contains("forbidden")
         || msg.contains("invalid credentials")
         || msg.contains("invalid token")
@@ -637,7 +657,12 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
     let uri = uri.to_string();
     let module_name = module_name.to_string();
     let token = token.map(|t| t.to_string());
-    let active_token: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(token.clone()));
+    let active_token: Arc<Mutex<Option<String>>> = use_hook(|| Arc::new(Mutex::new(token.clone())));
+    if let Ok(mut token_store) = active_token.lock() {
+        if *token_store != token {
+            *token_store = token.clone();
+        }
+    }
 
     let connection: SyncSignal<Option<SharedConnection>> = use_signal_sync(|| None);
     let state: SyncSignal<ConnectionState> = use_signal_sync(|| ConnectionState::Disconnected);
@@ -686,6 +711,7 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                     .lock()
                     .ok()
                     .and_then(|token| token.clone());
+                let had_user_token = token_for_build.is_some();
 
                 let disconnect_fatal: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
                 let disconnect_fatal_on_disconnect = disconnect_fatal.clone();
@@ -698,10 +724,10 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                 let mut table_signals_on_connect = table_signals.clone();
                 let active_token_on_connect = active_token.clone();
 
-                let conn = match DbConnection::builder()
+                let conn_builder = DbConnection::builder()
                     .with_uri(&uri)
                     .with_database_name(&module_name)
-                    .with_token(token_for_build)
+                    .with_token(token_for_build.clone())
                     .on_connect(move |conn, identity, token| {
                     // Populate initial rows for logged_out_player
                     let current: Vec<Player> = conn.db.logged_out_player().iter().collect();
@@ -810,8 +836,10 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                         let updated: Vec<TestFoobar> = ctx.db.test_f().iter().collect();
                         table_signals_on_connect.test_f.set(updated);
                     });
-                        if let Ok(mut token_store) = active_token_on_connect.lock() {
-                            *token_store = Some(token.to_string());
+                        if !had_user_token {
+                            if let Ok(mut token_store) = active_token_on_connect.lock() {
+                                *token_store = Some(token.to_string());
+                            }
                         }
 
                         // Store the assigned Identity and private access token in state so the app
@@ -830,15 +858,28 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                             }
                         }
                         state_on_disconnect.set(ConnectionState::Disconnected);
-                    })
-                    .build().await {
+                    });
+                #[cfg(target_arch = "wasm32")]
+                let build_res = conn_builder.build().await;
+                #[cfg(not(target_arch = "wasm32"))]
+                let build_res = conn_builder.build();
+                let conn = match build_res {
                     Ok(conn) => conn,
                     Err(e) => {
                         connection.set(None);
                         error.set(Some::<String>(e.to_string()));
                         if is_fatal_connection_error(&e) {
                             state.set(ConnectionState::Error);
-                            break;
+                            let failed_token = token_for_build.clone();
+                            loop {
+                                reconnect_sleep(1000).await;
+                                let current_token = active_token.lock().ok().and_then(|t| t.clone());
+                                if current_token != failed_token {
+                                    reconnect_attempt = 0;
+                                    break;
+                                }
+                            }
+                            continue;
                         }
                         reconnect_attempt = reconnect_attempt.saturating_add(1);
                         if !should_retry_reconnect(reconnect_attempt) {
@@ -866,14 +907,32 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
                     .unwrap_or(false);
                 if disconnected_with_fatal_error {
                     state.set(ConnectionState::Error);
-                    break;
+                    let failed_token = token_for_build.clone();
+                    loop {
+                        reconnect_sleep(1000).await;
+                        let current_token = active_token.lock().ok().and_then(|t| t.clone());
+                        if current_token != failed_token {
+                            reconnect_attempt = 0;
+                            break;
+                        }
+                    }
+                    continue;
                 }
 
                 if let Err(e) = run_result {
                     error.set(Some::<String>(e.to_string()));
                     if is_fatal_connection_error(&e) {
                         state.set(ConnectionState::Error);
-                        break;
+                        let failed_token = token_for_build.clone();
+                        loop {
+                            reconnect_sleep(1000).await;
+                            let current_token = active_token.lock().ok().and_then(|t| t.clone());
+                            if current_token != failed_token {
+                                reconnect_attempt = 0;
+                                break;
+                            }
+                        }
+                        continue;
                     }
                 }
 
@@ -1064,12 +1123,12 @@ pub fn use_reducer_add_then() -> (impl Fn(String, u8) + Clone + 'static, SyncSig
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_add_async() -> impl Fn(String, u8) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_add_async() -> impl Fn(String, u8) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |name: String, age: u8| {
+    move |name: String, age: u8| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1085,7 +1144,7 @@ pub fn use_reducer_add_async() -> impl Fn(String, u8) -> (impl std::future::Futu
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1146,12 +1205,12 @@ pub fn use_reducer_add_player_then() -> (impl Fn(String) + Clone + 'static, Sync
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_add_player_async() -> impl Fn(String) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_add_player_async() -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |name: String| {
+    move |name: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1167,7 +1226,7 @@ pub fn use_reducer_add_player_async() -> impl Fn(String) -> (impl std::future::F
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1228,12 +1287,12 @@ pub fn use_reducer_add_private_then() -> (impl Fn(String) + Clone + 'static, Syn
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_add_private_async() -> impl Fn(String) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_add_private_async() -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |name: String| {
+    move |name: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1249,7 +1308,7 @@ pub fn use_reducer_add_private_async() -> impl Fn(String) -> (impl std::future::
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1310,12 +1369,12 @@ pub fn use_reducer_assert_caller_identity_is_module_identity_then() -> (impl Fn(
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_assert_caller_identity_is_module_identity_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_assert_caller_identity_is_module_identity_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1331,7 +1390,7 @@ pub fn use_reducer_assert_caller_identity_is_module_identity_async() -> impl Fn(
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1392,12 +1451,12 @@ pub fn use_reducer_delete_player_then() -> (impl Fn(u64) + Clone + 'static, Sync
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_delete_player_async() -> impl Fn(u64) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_delete_player_async() -> impl Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |id: u64| {
+    move |id: u64| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1413,7 +1472,7 @@ pub fn use_reducer_delete_player_async() -> impl Fn(u64) -> (impl std::future::F
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1474,12 +1533,12 @@ pub fn use_reducer_delete_players_by_name_then() -> (impl Fn(String) + Clone + '
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_delete_players_by_name_async() -> impl Fn(String) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_delete_players_by_name_async() -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |name: String| {
+    move |name: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1495,7 +1554,89 @@ pub fn use_reducer_delete_players_by_name_async() -> impl Fn(String) -> (impl st
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
+        })
+    }
+}
+
+/// Get a callback to invoke the `expect_environment` reducer.
+#[must_use]
+pub fn use_reducer_expect_environment() -> impl Fn(String, Option::<String>) -> spacetimedb_sdk::Result<()> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |key: String, expected: Option::<String>| {
+        if let Some(conn) = conn_signal().as_ref() {
+            conn.reducers.expect_environment(key, expected)
+        } else {
+            Err(spacetimedb_sdk::Error::Disconnected)
         }
+    }
+}
+
+/// Invoke the `expect_environment` reducer and get a reactive signal for its completion status.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the reducer invocation to the server.
+/// The `result` signal is updated to `Some(Ok(()))` on success or `Some(Err(message))`
+/// on failure once the server notifies completion.
+#[must_use]
+pub fn use_reducer_expect_environment_then() -> (impl Fn(String, Option::<String>) + Clone + 'static, SyncSignal<Option<Result<(), String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<(), String>>> = use_signal_sync(|| None);
+
+    let invoke = move |key: String, expected: Option::<String>| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.expect_environment_then(key, expected, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                result.set(Some(Err(e.to_string())));
+                return;
+            }
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    let flattened = match res {
+                        Ok(Ok(())) => Ok(()),
+                        Ok(Err(module_err)) => Err(module_err),
+                        Err(sdk_err) => Err(sdk_err.to_string()),
+                    };
+                    result.set(Some(flattened));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
+        }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `expect_environment` reducer asynchronously and await its completion.
+///
+/// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
+#[must_use]
+pub fn use_reducer_expect_environment_async() -> impl Fn(String, Option::<String>) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |key: String, expected: Option::<String>| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
+        let conn = conn_signal();
+        Box::pin(async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            if let Err(e) = conn.reducers.expect_environment_then(key, expected, move |_ctx, res| {
+                let _ = tx.send(res);
+            }) {
+                return Err(e.to_string());
+            }
+            match rx.await {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(err))) => Err(err),
+                Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        })
     }
 }
 
@@ -1556,12 +1697,12 @@ pub fn use_reducer_list_over_age_then() -> (impl Fn(u8) + Clone + 'static, SyncS
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_list_over_age_async() -> impl Fn(u8) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_list_over_age_async() -> impl Fn(u8) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |age: u8| {
+    move |age: u8| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1577,7 +1718,7 @@ pub fn use_reducer_list_over_age_async() -> impl Fn(u8) -> (impl std::future::Fu
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1638,12 +1779,12 @@ pub fn use_reducer_log_module_identity_then() -> (impl Fn() + Clone + 'static, S
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_log_module_identity_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_log_module_identity_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1659,7 +1800,7 @@ pub fn use_reducer_log_module_identity_async() -> impl Fn() -> (impl std::future
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1720,12 +1861,12 @@ pub fn use_reducer_query_private_then() -> (impl Fn() + Clone + 'static, SyncSig
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_query_private_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_query_private_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1741,7 +1882,7 @@ pub fn use_reducer_query_private_async() -> impl Fn() -> (impl std::future::Futu
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1802,12 +1943,12 @@ pub fn use_reducer_say_hello_then() -> (impl Fn() + Clone + 'static, SyncSignal<
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_say_hello_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_say_hello_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1823,7 +1964,7 @@ pub fn use_reducer_say_hello_async() -> impl Fn() -> (impl std::future::Future<O
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1884,12 +2025,12 @@ pub fn use_reducer_test_then() -> (impl Fn(TestA, TestB, NamespaceTestC, Namespa
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_test_async() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_test_async() -> impl Fn(TestA, TestB, NamespaceTestC, NamespaceTestF) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |arg: TestA, arg_2: TestB, arg_3: NamespaceTestC, arg_4: NamespaceTestF| {
+    move |arg: TestA, arg_2: TestB, arg_3: NamespaceTestC, arg_4: NamespaceTestF| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1905,7 +2046,7 @@ pub fn use_reducer_test_async() -> impl Fn(TestA, TestB, NamespaceTestC, Namespa
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -1966,12 +2107,12 @@ pub fn use_reducer_test_btree_index_args_then() -> (impl Fn() + Clone + 'static,
 ///
 /// Returns a closure that can be called to invoke the reducer and `await` its completion directly.
 #[must_use]
-pub fn use_reducer_test_btree_index_args_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_reducer_test_btree_index_args_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -1987,7 +2128,7 @@ pub fn use_reducer_test_btree_index_args_async() -> impl Fn() -> (impl std::futu
                 Ok(Err(sdk_err)) => Err(sdk_err.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -2028,12 +2169,12 @@ pub fn use_procedure_get_my_schema_via_http() -> (impl Fn() + Clone + 'static, S
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_get_my_schema_via_http_async() -> impl Fn() -> (impl std::future::Future<Output = Result<String, String>> + Clone + 'static) {
+pub fn use_procedure_get_my_schema_via_http_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -2045,7 +2186,63 @@ pub fn use_procedure_get_my_schema_via_http_async() -> impl Fn() -> (impl std::f
                 Ok(res) => res.map_err(|e| e.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
+        })
+    }
+}
+
+/// Invoke the `read_environment` procedure and get a reactive signal for its result.
+///
+/// Returns `(invoke, result)`. Calling `invoke(...)` sends the procedure call to the server.
+/// The `result` signal is updated to `Some(Ok(value))` on success or `Some(Err(message))`
+/// on failure once the server responds.
+#[must_use]
+pub fn use_procedure_read_environment() -> (impl Fn(String) + Clone + 'static, SyncSignal<Option<Result<Option<String>, String>>>) {
+    let conn_signal = use_connection();
+    let mut result: SyncSignal<Option<Result<Option<String>, String>>> = use_signal_sync(|| None);
+
+    let invoke = move |key: String| {
+        let mut result = result;
+        result.set(None);
+        if let Some(conn) = conn_signal().as_ref() {
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.read_environment_then(key, move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            spawn(async move {
+                if let Ok(res) = rx.await {
+                    result.set(Some(res.map_err(|e| e.to_string())));
+                }
+            });
+        } else {
+            result.set(Some(Err("Disconnected from SpacetimeDB".to_string())));
         }
+    };
+
+    (invoke, result)
+}
+
+/// Invoke the `read_environment` procedure asynchronously.
+///
+/// Returns a closure that can be called to invoke the procedure and `await` the response directly.
+#[must_use]
+pub fn use_procedure_read_environment_async() -> impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, String>>>> + Clone + 'static {
+    let conn_signal = use_connection();
+
+    move |key: String| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, String>>>> {
+        let conn = conn_signal();
+        Box::pin(async move {
+            let Some(conn) = conn.as_ref() else {
+                return Err("Disconnected from SpacetimeDB".to_string());
+            };
+            let (tx, rx) = oneshot::channel();
+            conn.procedures.read_environment_then(key, move |_ctx, res| {
+                let _ = tx.send(res);
+            });
+            match rx.await {
+                Ok(res) => res.map_err(|e| e.to_string()),
+                Err(_) => Err("Request cancelled".to_string()),
+            }
+        })
     }
 }
 
@@ -2084,12 +2281,12 @@ pub fn use_procedure_return_value() -> (impl Fn(u64) + Clone + 'static, SyncSign
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_return_value_async() -> impl Fn(u64) -> (impl std::future::Future<Output = Result<Baz, String>> + Clone + 'static) {
+pub fn use_procedure_return_value_async() -> impl Fn(u64) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Baz, String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move |foo: u64| {
+    move |foo: u64| -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Baz, String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -2101,7 +2298,7 @@ pub fn use_procedure_return_value_async() -> impl Fn(u64) -> (impl std::future::
                 Ok(res) => res.map_err(|e| e.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -2140,12 +2337,12 @@ pub fn use_procedure_sleep_one_second() -> (impl Fn() + Clone + 'static, SyncSig
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_sleep_one_second_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_procedure_sleep_one_second_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -2157,7 +2354,7 @@ pub fn use_procedure_sleep_one_second_async() -> impl Fn() -> (impl std::future:
                 Ok(res) => res.map_err(|e| e.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -2196,12 +2393,12 @@ pub fn use_procedure_with_tx() -> (impl Fn() + Clone + 'static, SyncSignal<Optio
 ///
 /// Returns a closure that can be called to invoke the procedure and `await` the response directly.
 #[must_use]
-pub fn use_procedure_with_tx_async() -> impl Fn() -> (impl std::future::Future<Output = Result<(), String>> + Clone + 'static) {
+pub fn use_procedure_with_tx_async() -> impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> + Clone + 'static {
     let conn_signal = use_connection();
 
-    move || {
+    move || -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>>>> {
         let conn = conn_signal();
-        async move {
+        Box::pin(async move {
             let Some(conn) = conn.as_ref() else {
                 return Err("Disconnected from SpacetimeDB".to_string());
             };
@@ -2213,7 +2410,7 @@ pub fn use_procedure_with_tx_async() -> impl Fn() -> (impl std::future::Future<O
                 Ok(res) => res.map_err(|e| e.to_string()),
                 Err(_) => Err("Request cancelled".to_string()),
             }
-        }
+        })
     }
 }
 
@@ -2231,6 +2428,84 @@ pub fn use_connection_state() -> SyncSignal<ConnectionState> {
 pub fn use_connection_error() -> SyncSignal<Option<String>> {
     let ctx = use_spacetimedb_context();
     ctx.error
+}
+'''
+"expect_environment_reducer.rs" = '''
+// THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
+// WILL NOT BE SAVED. MODIFY TABLES IN YOUR MODULE SOURCE CODE INSTEAD.
+
+VERSION_COMMENT
+
+#![allow(unused, clippy::all)]
+use spacetimedb_sdk::__codegen::{
+    self as __sdk,
+    __lib,
+    __sats,
+    __ws,
+};
+
+
+#[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
+#[sats(crate = __lib)]
+pub(super) struct ExpectEnvironmentArgs {
+    pub key: String,
+    pub expected: Option<String>,
+}
+
+impl From<ExpectEnvironmentArgs> for super::Reducer {
+    fn from(args: ExpectEnvironmentArgs) -> Self {
+        Self::ExpectEnvironment {
+            key: args.key,
+            expected: args.expected,
+        }
+    }
+}
+
+impl __sdk::InModule for ExpectEnvironmentArgs {
+    type Module = super::RemoteModule;
+}
+
+#[allow(non_camel_case_types)]
+/// Extension trait for access to the reducer `expect_environment`.
+///
+/// Implemented for [`super::RemoteReducers`].
+pub trait expect_environment {
+    /// Request that the remote module invoke the reducer `expect_environment` to run as soon as possible.
+    ///
+    /// This method returns immediately, and errors only if we are unable to send the request.
+    /// The reducer will run asynchronously in the future,
+    ///  and this method provides no way to listen for its completion status.
+    ///
+    /// Use [`expect_environment::expect_environment_then`] to run a callback after the reducer completes.
+    fn expect_environment(&self, key: String, expected: Option<String>) -> __sdk::Result<()> {
+        self.expect_environment_then(key, expected, |_, _| {})
+    }
+
+    /// Request that the remote module invoke the reducer `expect_environment` to run as soon as possible,
+    /// registering `callback` to run when we are notified that the reducer completed.
+    ///
+    /// This method returns immediately, and errors only if we are unable to send the request.
+    /// The reducer will run asynchronously in the future,
+    ///  and its status can be observed with the `callback`.
+    fn expect_environment_then(
+        &self,
+        key: String, expected: Option<String>,
+        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
+            + Send
+            + 'static,
+    ) -> __sdk::Result<()>;
+}
+
+impl expect_environment for super::RemoteReducers {
+    fn expect_environment_then(
+        &self,
+        key: String, expected: Option<String>,
+        callback: impl FnOnce(&super::ReducerEventContext, Result<Result<(), String>, __sdk::InternalError>)
+            + Send
+            + 'static,
+    ) -> __sdk::Result<()> {
+        self.imp.invoke_reducer_with_callback(ExpectEnvironmentArgs { key, expected }, callback)
+    }
 }
 '''
 "foobar_type.rs" = '''
@@ -2860,6 +3135,7 @@ pub mod add_private_reducer;
 pub mod assert_caller_identity_is_module_identity_reducer;
 pub mod delete_player_reducer;
 pub mod delete_players_by_name_reducer;
+pub mod expect_environment_reducer;
 pub mod list_over_age_reducer;
 pub mod log_module_identity_reducer;
 pub mod query_private_reducer;
@@ -2874,6 +3150,7 @@ pub mod test_f_table;
 pub mod my_player_table;
 pub mod test_e_view_table;
 pub mod get_my_schema_via_http_procedure;
+pub mod read_environment_procedure;
 pub mod return_value_procedure;
 pub mod sleep_one_second_procedure;
 pub mod with_tx_procedure;
@@ -2909,6 +3186,7 @@ pub use add_private_reducer::add_private;
 pub use assert_caller_identity_is_module_identity_reducer::assert_caller_identity_is_module_identity;
 pub use delete_player_reducer::delete_player;
 pub use delete_players_by_name_reducer::delete_players_by_name;
+pub use expect_environment_reducer::expect_environment;
 pub use list_over_age_reducer::list_over_age;
 pub use log_module_identity_reducer::log_module_identity;
 pub use query_private_reducer::query_private;
@@ -2916,6 +3194,7 @@ pub use say_hello_reducer::say_hello;
 pub use test_reducer::test;
 pub use test_btree_index_args_reducer::test_btree_index_args;
 pub use get_my_schema_via_http_procedure::get_my_schema_via_http;
+pub use read_environment_procedure::read_environment;
 pub use return_value_procedure::return_value;
 pub use sleep_one_second_procedure::sleep_one_second;
 pub use with_tx_procedure::with_tx;
@@ -2944,6 +3223,10 @@ pub enum Reducer {
 }    ,
     DeletePlayersByName {
         name: String,
+}    ,
+    ExpectEnvironment {
+        key: String,
+        expected: Option::<String>,
 }    ,
     ListOverAge {
         age: u8,
@@ -2974,6 +3257,7 @@ impl __sdk::Reducer for Reducer {
             Reducer::AssertCallerIdentityIsModuleIdentity => "assert_caller_identity_is_module_identity",
             Reducer::DeletePlayer { .. } => "delete_player",
             Reducer::DeletePlayersByName { .. } => "delete_players_by_name",
+            Reducer::ExpectEnvironment { .. } => "expect_environment",
             Reducer::ListOverAge { .. } => "list_over_age",
             Reducer::LogModuleIdentity => "log_module_identity",
             Reducer::QueryPrivate => "query_private",
@@ -3014,6 +3298,13 @@ Reducer::DeletePlayer{
                 name,
 }             => __sats::bsatn::to_vec(&delete_players_by_name_reducer::DeletePlayersByNameArgs {
                 name: name.clone(),
+}),
+            Reducer::ExpectEnvironment{
+                key,
+                expected,
+}             => __sats::bsatn::to_vec(&expect_environment_reducer::ExpectEnvironmentArgs {
+                key: key.clone(),
+                expected: expected.clone(),
 }),
             Reducer::ListOverAge{
                 age,
@@ -5050,6 +5341,64 @@ impl query_private for super::RemoteReducers {
         self.imp.invoke_reducer_with_callback(QueryPrivateArgs {  }, callback)
     }
 }
+'''
+"read_environment_procedure.rs" = '''
+// THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
+// WILL NOT BE SAVED. MODIFY TABLES IN YOUR MODULE SOURCE CODE INSTEAD.
+
+#![allow(unused, clippy::all)]
+use spacetimedb_sdk::__codegen::{
+	self as __sdk,
+	__lib,
+	__sats,
+	__ws,
+};
+
+
+#[derive(__lib::ser::Serialize, __lib::de::Deserialize, Clone, PartialEq, Debug)]
+#[sats(crate = __lib)]
+ struct ReadEnvironmentArgs {
+    pub key: String,
+}
+
+
+impl __sdk::InModule for ReadEnvironmentArgs {
+    type Module = super::RemoteModule;
+}
+
+#[allow(non_camel_case_types)]
+/// Extension trait for access to the procedure `read_environment`.
+///
+/// Implemented for [`super::RemoteProcedures`].
+pub trait read_environment {
+    fn read_environment(&self, key: String,
+) {
+        self.read_environment_then(key,  |_, _| {});
+    }
+
+    fn read_environment_then(
+        &self,
+        key: String,
+
+        __callback: impl FnOnce(&super::ProcedureEventContext, Result<Option::<String>, __sdk::InternalError>) + Send + 'static,
+    );
+}
+
+impl read_environment for super::RemoteProcedures {
+    fn read_environment_then(
+        &self,
+        key: String,
+
+        __callback: impl FnOnce(&super::ProcedureEventContext, Result<Option::<String>, __sdk::InternalError>) + Send + 'static,
+    ) {
+        self.imp.invoke_procedure_with_callback::<_, Option::<String>>(
+            "read_environment",
+            ReadEnvironmentArgs { key,  },
+            __callback,
+        );
+    }
+}
+
 '''
 "remove_table_type.rs" = '''
 // THIS FILE IS AUTOMATICALLY GENERATED BY SPACETIMEDB. EDITS TO THIS FILE
