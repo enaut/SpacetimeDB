@@ -1,5 +1,6 @@
 ---
 source: crates/codegen/tests/codegen.rs
+assertion_line: 42
 expression: outfiles
 ---
 "add_player_reducer.rs" = '''
@@ -657,9 +658,12 @@ pub fn use_spacetimedb_context_provider(uri: &str, module_name: &str, token: Opt
     let uri = uri.to_string();
     let module_name = module_name.to_string();
     let token = token.map(|t| t.to_string());
+    let initial_caller_token = token.clone();
+    let caller_token: Arc<Mutex<Option<String>>> = use_hook(|| Arc::new(Mutex::new(initial_caller_token)));
     let active_token: Arc<Mutex<Option<String>>> = use_hook(|| Arc::new(Mutex::new(token.clone())));
-    if let Ok(mut token_store) = active_token.lock() {
-        if *token_store != token {
+    if let (Ok(mut caller_store), Ok(mut token_store)) = (caller_token.lock(), active_token.lock()) {
+        if *caller_store != token {
+            *caller_store = token.clone();
             *token_store = token.clone();
         }
     }
