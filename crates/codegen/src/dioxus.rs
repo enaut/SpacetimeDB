@@ -835,18 +835,9 @@ fn write_reconnect_helpers(out: &mut Indenter) {
     writeln!(out, "    }}");
     writeln!(out, "    #[cfg(target_arch = \"wasm32\")]");
     writeln!(out, "    {{");
-    writeln!(
-        out,
-        "        let delay_clamped = delay_ms.min(i32::MAX as u64) as i32;"
-    );
-    writeln!(
-        out,
-        "        let promise = js_sys::Promise::new(&mut |resolve, _| {{"
-    );
-    writeln!(
-        out,
-        "            if let Some(window) = web_sys::window() {{"
-    );
+    writeln!(out, "        let delay_clamped = delay_ms.min(i32::MAX as u64) as i32;");
+    writeln!(out, "        let promise = js_sys::Promise::new(&mut |resolve, _| {{");
+    writeln!(out, "            if let Some(window) = web_sys::window() {{");
     writeln!(
         out,
         "                let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0("
@@ -924,15 +915,21 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "    let uri = uri.to_string();");
     writeln!(out, "    let module_name = module_name.to_string();");
     writeln!(out, "    let token = token.map(|t| t.to_string());");
+    writeln!(out, "    let initial_caller_token = token.clone();");
+    writeln!(
+        out,
+        "    let caller_token: Arc<Mutex<Option<String>>> = use_hook(|| Arc::new(Mutex::new(initial_caller_token)));"
+    );
     writeln!(
         out,
         "    let active_token: Arc<Mutex<Option<String>>> = use_hook(|| Arc::new(Mutex::new(token.clone())));"
     );
     writeln!(
         out,
-        "    if let Ok(mut token_store) = active_token.lock() {{"
+        "    if let (Ok(mut caller_store), Ok(mut token_store)) = (caller_token.lock(), active_token.lock()) {{"
     );
-    writeln!(out, "        if *token_store != token {{");
+    writeln!(out, "        if *caller_store != token {{");
+    writeln!(out, "            *caller_store = token.clone();");
     writeln!(out, "            *token_store = token.clone();");
     writeln!(out, "        }}");
     writeln!(out, "    }}");
@@ -997,10 +994,7 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "                    .lock()");
     writeln!(out, "                    .ok()");
     writeln!(out, "                    .and_then(|token| token.clone());");
-    writeln!(
-        out,
-        "                let had_user_token = token_for_build.is_some();"
-    );
+    writeln!(out, "                let had_user_token = token_for_build.is_some();");
     writeln!(out);
     writeln!(
         out,
@@ -1095,10 +1089,7 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
         writeln!(out, "                    }});");
     }
 
-    writeln!(
-        out,
-        "                        if !had_user_token {{"
-    );
+    writeln!(out, "                        if !had_user_token {{");
     writeln!(
         out,
         "                            if let Ok(mut token_store) = active_token_on_connect.lock() {{"
@@ -1148,22 +1139,10 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
         "                        state_on_disconnect.set(ConnectionState::Disconnected);"
     );
     writeln!(out, "                    }});");
-    writeln!(
-        out,
-        "                #[cfg(target_arch = \"wasm32\")]"
-    );
-    writeln!(
-        out,
-        "                let build_res = conn_builder.build().await;"
-    );
-    writeln!(
-        out,
-        "                #[cfg(not(target_arch = \"wasm32\"))]"
-    );
-    writeln!(
-        out,
-        "                let build_res = conn_builder.build();"
-    );
+    writeln!(out, "                #[cfg(target_arch = \"wasm32\")]");
+    writeln!(out, "                let build_res = conn_builder.build().await;");
+    writeln!(out, "                #[cfg(not(target_arch = \"wasm32\"))]");
+    writeln!(out, "                let build_res = conn_builder.build();");
     writeln!(out, "                let conn = match build_res {{");
     writeln!(out, "                    Ok(conn) => conn,");
     writeln!(out, "                    Err(e) => {{");
@@ -1171,11 +1150,20 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "                        error.set(Some::<String>(e.to_string()));");
     writeln!(out, "                        if is_fatal_connection_error(&e) {{");
     writeln!(out, "                            state.set(ConnectionState::Error);");
-    writeln!(out, "                            let failed_token = token_for_build.clone();");
+    writeln!(
+        out,
+        "                            let failed_token = token_for_build.clone();"
+    );
     writeln!(out, "                            loop {{");
     writeln!(out, "                                reconnect_sleep(1000).await;");
-    writeln!(out, "                                let current_token = active_token.lock().ok().and_then(|t| t.clone());");
-    writeln!(out, "                                if current_token != failed_token {{");
+    writeln!(
+        out,
+        "                                let current_token = active_token.lock().ok().and_then(|t| t.clone());"
+    );
+    writeln!(
+        out,
+        "                                if current_token != failed_token {{"
+    );
     writeln!(out, "                                    reconnect_attempt = 0;");
     writeln!(out, "                                    break;");
     writeln!(out, "                                }}");
@@ -1229,7 +1217,10 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "                    let failed_token = token_for_build.clone();");
     writeln!(out, "                    loop {{");
     writeln!(out, "                        reconnect_sleep(1000).await;");
-    writeln!(out, "                        let current_token = active_token.lock().ok().and_then(|t| t.clone());");
+    writeln!(
+        out,
+        "                        let current_token = active_token.lock().ok().and_then(|t| t.clone());"
+    );
     writeln!(out, "                        if current_token != failed_token {{");
     writeln!(out, "                            reconnect_attempt = 0;");
     writeln!(out, "                            break;");
@@ -1242,10 +1233,16 @@ fn write_context_provider(out: &mut Indenter, tables: &[TableInfo]) {
     writeln!(out, "                    error.set(Some::<String>(e.to_string()));");
     writeln!(out, "                    if is_fatal_connection_error(&e) {{");
     writeln!(out, "                        state.set(ConnectionState::Error);");
-    writeln!(out, "                        let failed_token = token_for_build.clone();");
+    writeln!(
+        out,
+        "                        let failed_token = token_for_build.clone();"
+    );
     writeln!(out, "                        loop {{");
     writeln!(out, "                            reconnect_sleep(1000).await;");
-    writeln!(out, "                            let current_token = active_token.lock().ok().and_then(|t| t.clone());");
+    writeln!(
+        out,
+        "                            let current_token = active_token.lock().ok().and_then(|t| t.clone());"
+    );
     writeln!(out, "                            if current_token != failed_token {{");
     writeln!(out, "                                reconnect_attempt = 0;");
     writeln!(out, "                                break;");
