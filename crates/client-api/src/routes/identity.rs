@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use spacetimedb_lib::de::serde::DeserializeWrapper;
 use spacetimedb_lib::Identity;
 
-use crate::auth::{JwtAuthProvider, SpacetimeAuth, SpacetimeAuthRequired, TokenClaims};
+use crate::auth::{JwtAuthProvider, SpacetimeAuth, SpacetimeAuthRequired};
 use crate::{log_and_500, ControlStateDelegate, NodeDelegate};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,58 +96,6 @@ pub struct WebsocketTokenResponse {
     pub token: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct CreateApiTokenParams {
-    #[serde(default)]
-    pub role: Option<String>,
-    #[serde(default)]
-    pub entity_id: Option<u32>,
-    #[serde(default)]
-    pub label: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreateApiTokenResponse {
-    pub identity: Identity,
-    pub token: String,
-}
-
-// This endpoint takes a token from an authenticated client and mints a permanent API token
-// signed by SpacetimeDB's key with no expiration (`exp: None`).
-// If a `role` is specified, a distinct sub-agent subject is generated (`<user_sub>:ai:<role>:<entity_id>`),
-// yielding a dedicated, deterministic `Identity` for that AI controller/agent.
-pub async fn create_api_token<S: NodeDelegate>(
-    State(ctx): State<S>,
-    SpacetimeAuthRequired(auth): SpacetimeAuthRequired,
-    body: Option<axum::Json<CreateApiTokenParams>>,
-) -> axum::response::Result<impl IntoResponse> {
-    let params = body.map(|b| b.0).unwrap_or_default();
-
-    let subject = if let Some(role) = params.role.filter(|r| !r.trim().is_empty()) {
-        let entity_str = params
-            .entity_id
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "0".to_string());
-        format!("{}:ai:{}:{}", auth.claims.subject, role.trim(), entity_str).into()
-    } else {
-        auth.claims.subject.clone()
-    };
-
-    let claims = TokenClaims {
-        issuer: auth.claims.issuer.clone(),
-        subject,
-        audience: auth.claims.audience.clone(),
-        extra: auth.claims.extra.clone(),
-    };
-
-    let (claims, token) = claims.encode_and_sign(ctx.jwt_auth_provider()).map_err(log_and_500)?;
-
-    Ok(axum::Json(CreateApiTokenResponse {
-        identity: claims.identity,
-        token,
-    }))
-}
-
 // This endpoint takes a token from a client and sends a newly signed token with a 60s expiry.
 // Note that even if the token has a different issuer, we will sign it with our key.
 // This is ok because `FullTokenValidator` checks if we signed the token before worrying about the issuer.
@@ -194,10 +142,8 @@ pub struct IdentityRoutes<S> {
     pub create_post: MethodRouter<S>,
     /// GET /identity/public-key
     pub public_key_get: MethodRouter<S>,
-    /// POST /identity/websocket-token
+    /// POST /identity/websocket-tocken
     pub websocket_token_post: MethodRouter<S>,
-    /// POST /identity/api-token
-    pub api_token_post: MethodRouter<S>,
     /// GET /identity/:identity/verify
     pub verify_get: MethodRouter<S>,
     /// GET /identity/:identity/databases
@@ -214,7 +160,6 @@ where
             create_post: post(create_identity::<S>),
             public_key_get: get(get_public_key::<S>),
             websocket_token_post: post(create_websocket_token::<S>),
-            api_token_post: post(create_api_token::<S>),
             verify_get: get(validate_token),
             databases_get: get(get_databases::<S>),
         }
@@ -230,7 +175,6 @@ where
             .route("/", self.create_post)
             .route("/public-key", self.public_key_get)
             .route("/websocket-token", self.websocket_token_post)
-            .route("/api-token", self.api_token_post)
             .route("/:identity/verify", self.verify_get)
             .route("/:identity/databases", self.databases_get)
     }
