@@ -545,6 +545,7 @@ fn prepare_generate_run_configs<'a>(
                 Language::Rust | Language::TypeScript => "src/remote_bindings",
                 Language::Csharp | Language::Cpp => "remote_bindings",
                 Language::UnrealCpp => unreachable!("Unreal module bindings rejected above"),
+                Language::Dioxus => anyhow::bail!("Dioxus is a client binding target"),
             };
             command_config
                 .get_resolved_path("out_dir", config_dir)?
