@@ -6,7 +6,7 @@ use clap::Arg;
 use clap::ArgAction::{Set, SetTrue};
 use fs_err as fs;
 use spacetimedb_codegen::{
-    generate, generate_receiver_bindings, private_table_names, CodegenOptions, CodegenVisibility, Csharp,
+    generate, generate_receiver_bindings, private_table_names, CodegenOptions, CodegenVisibility, Csharp, Dioxus,
     ImportExtension, Lang, OutputFile, ReceiverLanguage, Rust, TypeScript, UnrealCpp, AUTO_GENERATED_PREFIX,
 };
 use spacetimedb_lib::de::serde::DeserializeWrapper;
@@ -545,6 +545,7 @@ fn prepare_generate_run_configs<'a>(
                 Language::Rust | Language::TypeScript => "src/remote_bindings",
                 Language::Csharp | Language::Cpp => "remote_bindings",
                 Language::UnrealCpp => unreachable!("Unreal module bindings rejected above"),
+                Language::Dioxus => anyhow::bail!("Dioxus is a client binding target"),
             };
             command_config
                 .get_resolved_path("out_dir", config_dir)?
@@ -630,12 +631,13 @@ fn language_cli_name(lang: Language) -> &'static str {
         Language::TypeScript => "typescript",
         Language::UnrealCpp => "unrealcpp",
         Language::Cpp => "cpp",
+        Language::Dioxus => "dioxus",
     }
 }
 
 pub fn default_out_dir_for_language(lang: Language) -> Option<PathBuf> {
     match lang {
-        Language::Rust | Language::TypeScript => Some(PathBuf::from("src/module_bindings")),
+        Language::Rust | Language::TypeScript | Language::Dioxus => Some(PathBuf::from("src/module_bindings")),
         Language::Csharp => Some(PathBuf::from("module_bindings")),
         Language::UnrealCpp | Language::Cpp => None,
     }
@@ -670,11 +672,7 @@ fn generate_dependency_module_files(files: Vec<OutputFile>, dependency_name: &st
     files
         .into_iter()
         .map(|OutputFile { filename, code }| {
-            let filename = if filename == "lib.rs" {
-                format!("{dependency_name}/mod.rs")
-            } else {
-                format!("{dependency_name}/{filename}")
-            };
+            let filename = format!("{dependency_name}/{filename}");
             OutputFile { filename, code }
         })
         .collect()
@@ -785,6 +783,7 @@ pub async fn run_prepared_generate_configs(
                 },
                 Language::Cpp => ReceiverLanguage::Cpp,
                 Language::UnrealCpp => anyhow::bail!("Unreal C++ is a client binding target"),
+                Language::Dioxus => anyhow::bail!("Dioxus is a client binding target"),
             };
             let files = generate_receiver_bindings(&module, lang, run.dependency_name.as_deref())?;
             if run.lang == Language::Rust
@@ -827,6 +826,7 @@ pub async fn run_prepared_generate_configs(
                 Language::Cpp => {
                     anyhow::bail!("C++ client bindings are not supported; use --lang unrealcpp for Unreal")
                 }
+                Language::Dioxus => &Dioxus,
             };
             generate(&module, gen_lang, &options)
         };
@@ -1032,11 +1032,20 @@ pub enum Language {
     Cpp,
     #[serde(alias = "uecpp", alias = "ue5cpp", alias = "unreal")]
     UnrealCpp,
+    #[serde(alias = "dx", alias = "DX")]
+    Dioxus,
 }
 
 impl clap::ValueEnum for Language {
     fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Csharp, Self::TypeScript, Self::Rust, Self::Cpp, Self::UnrealCpp]
+        &[
+            Self::Csharp,
+            Self::TypeScript,
+            Self::Rust,
+            Self::Cpp,
+            Self::UnrealCpp,
+            Self::Dioxus,
+        ]
     }
     fn to_possible_value(&self) -> Option<PossibleValue> {
         Some(match self {
@@ -1045,6 +1054,7 @@ impl clap::ValueEnum for Language {
             Self::Rust => clap::builder::PossibleValue::new("rust").aliases(["rs", "RS"]),
             Self::Cpp => PossibleValue::new("cpp").aliases(["c++", "cxx"]),
             Self::UnrealCpp => PossibleValue::new("unrealcpp").aliases(["uecpp", "ue5cpp", "unreal"]),
+            Self::Dioxus => PossibleValue::new("dioxus").aliases(["dx", "DX"]),
         })
     }
 }
@@ -1058,12 +1068,13 @@ impl Language {
             Language::TypeScript => "TypeScript",
             Language::UnrealCpp => "Unreal C++",
             Language::Cpp => "C++",
+            Language::Dioxus => "Dioxus",
         }
     }
 
     fn format_files(&self, project_dir: &Path, generated_files: BTreeSet<PathBuf>) -> anyhow::Result<()> {
         match self {
-            Language::Rust => rustfmt(generated_files)?,
+            Language::Rust | Language::Dioxus => rustfmt(generated_files)?,
             Language::Csharp => dotnet_format(project_dir, generated_files)?,
             Language::TypeScript => {
                 // TODO: implement formatting.
